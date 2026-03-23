@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "reg-adapter.fullname" . }}-config
+  labels:
+    {{- include "reg-adapter.labels" . | nindent 4 }}
+data:
+  mappings.yaml: |
+    zones: []
+  hot_reload_seconds: "{{ .Values.config.hot_reload_seconds }}"
+  rate_limiter.requests_per_minute: "{{ .Values.config.rate_limiter.requests_per_minute }}"
+  rate_limiter.burst: "{{ .Values.config.rate_limiter.burst }}"
+  retry.max_attempts: "{{ .Values.config.retry.max_attempts }}"
+  retry.initial_backoff_seconds: "{{ .Values.config.retry.initial_backoff_seconds }}"
+  retry.max_backoff_seconds: "{{ .Values.config.retry.max_backoff_seconds }}"
+

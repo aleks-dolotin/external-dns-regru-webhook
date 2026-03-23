@@ -1,0 +1,20 @@
+.idea/
+**/*.iml
+*.iws
+*.ipr
+.claude/
+.github/skills
+.github/prompts
+_bmad/
+_bmad-output/
+.playwright-mcp/
+
+# Build artifacts
+bin/
+tmp/
+agent/wg-sockd
+spike/spike-local
+spike/spike-arm64
+spike/spike-amd64
+cmd/wg-sockd-ctl/wg-sockd-ctl
+agent/cmd/wg-sockd/ui_dist/

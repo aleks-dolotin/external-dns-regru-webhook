@@ -1,0 +1,11 @@
+apiVersion: v2
+name: reg-adapter
+description: Helm chart for ExternalDNS → Reg.ru adapter (sidecar + worker)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - reg.ru
+  - externaldns
+  - adapter
+

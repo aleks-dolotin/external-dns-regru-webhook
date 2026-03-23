@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "reg-adapter.fullname" . }}-worker
+  labels:
+    {{- include "reg-adapter.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "reg-adapter.fullname" . }}-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "reg-adapter.fullname" . }}-worker
+    spec:
+      containers:
+        - name: reg-adapter-worker
+          image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: CONFIG_PATH
+              value: "/etc/reg-adapter/config/mappings.yaml"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/reg-adapter/config
+              readOnly: true
+          resources:
+{{ toYaml .Values.resources.worker | indent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "reg-adapter.fullname" . }}-config
+

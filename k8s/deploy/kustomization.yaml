@@ -1,0 +1,10 @@
+resources:
+  - namespace.yaml
+  - configmap-reg-adapter.yaml
+  - secret-reg-credentials.yaml
+  - deployment-reg-adapter.yaml
+  - deployment-reg-worker.yaml
+  - service-and-monitor.yaml
+  - hpa-reg-worker.yaml
+  - pdb-reg-adapter.yaml
+

@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: reg-adapter-config
+  namespace: reg-adapter
+  labels:
+    app.kubernetes.io/name: reg-adapter
+data:
+  # Example mapping: zone -> namespace/label selector and fqdn template
+  mappings.yaml: |
+    zones:
+      - zone: example.com
+        namespaces: ["prod","staging"]
+        template: "{{name}}.example.com"
+
+  # Hot-reload interval (seconds). Adapter should support ConfigMap watch and apply within this window.
+  hot_reload_seconds: "30"
+
+  # Rate limiter defaults (per-zone)
+  rate_limiter:
+    requests_per_minute: "1200"
+    burst: "200"
+
+  # Retry/backoff policy
+  retry:
+    max_attempts: "5"
+    initial_backoff_seconds: "1"
+    max_backoff_seconds: "60"
+

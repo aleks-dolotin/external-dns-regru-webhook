@@ -1,0 +1,58 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/example/reg-adapter
+  tag: latest
+  pullPolicy: IfNotPresent
+
+worker:
+  replicaCount: 2
+  image:
+    repository: ghcr.io/example/reg-adapter-worker
+    tag: latest
+    pullPolicy: IfNotPresent
+
+resources:
+  adapter:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  worker:
+    requests:
+      cpu: "300m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+config:
+  hot_reload_seconds: 30
+  rate_limiter:
+    requests_per_minute: 1200
+    burst: 200
+  retry:
+    max_attempts: 5
+    initial_backoff_seconds: 1
+    max_backoff_seconds: 60
+
+service:
+  type: ClusterIP
+  port: 80
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 60
+
+secret:
+  create: false
+  name: reg-credentials
+
+prometheus:
+  serviceMonitor:
+    enabled: true
+

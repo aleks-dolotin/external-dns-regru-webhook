@@ -1,0 +1,324 @@
+openapi: '3.0.3'
+info:
+  title: ExternalDNS RegRu Adapter API
+  version: '1.0.0'
+  description: >-
+    Minimal internal API for the ExternalDNS to Reg.ru adapter. This
+    document describes endpoints used by sidecar and orchestration
+    components for record operations, diagnostics and admin controls.
+servers:
+  - url: https://adapter.internal.example.com
+    description: Internal adapter base URL (example)
+paths:
+  /adapter/v1/records/query:
+    post:
+      tags: [records]
+      summary: "Query resource records"
+      description: >-
+        Return information about resource records for one or more domains.
+      operationId: queryRecords
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GetResourceRecordsRequest'
+      responses:
+        '200':
+          description: Successful query
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetResourceRecordsResponse'
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /adapter/v1/records/update:
+    post:
+      tags: [records]
+      summary: "Create or update records (batch)"
+      description: >-
+        Perform batched record operations (add/update/remove) using an
+        action_list. Intended to map to Reg.ru `zone/update_records`.
+      operationId: updateRecords
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRecordsRequest'
+      responses:
+        '200':
+          description: Update accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateRecordsResponse'
+        '429':
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /adapter/v1/records/remove:
+    post:
+      tags: [records]
+      summary: "Remove a record"
+      description: >-
+        Remove a specific DNS record. Idempotent: removing a non-existing
+        record is considered a successful no-op.
+      operationId: removeRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RemoveRecordRequest'
+      responses:
+        '200':
+          description: Remove accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericSuccess'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /adapter/v1/diagnostics:
+    get:
+      tags: [diagnostics]
+      summary: "Adapter diagnostics and health"
+      description: >-
+        Return diagnostics including queue depth, worker status, last
+        heartbeat to Reg.ru and recent error counts.
+      operationId: diagnostics
+      responses:
+        '200':
+          description: Diagnostics snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiagnosticsResponse'
+
+  /adapter/v1/admin/safe-mode:
+    post:
+      tags: [admin]
+      summary: "Admin control: set safe-mode (no-write)"
+      description: >-
+        Toggle safe-mode on the adapter. When enabled, write operations are
+        disabled and queued for replay.
+      operationId: setSafeMode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled:
+                  type: boolean
+                  description: true to enable safe-mode (no write)
+      responses:
+        '200':
+          description: Safe-mode updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenericSuccess'
+        '403':
+          description: Forbidden (insufficient privileges)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Adapter-Token
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    DomainEntry:
+      type: object
+      properties:
+        dname:
+          type: string
+          description: Fully-qualified domain name (zone) or domain identifier
+        rrs:
+          type: array
+          items:
+            type: object
+            description: Resource record set entry (type, ttl, content, etc.)
+
+    GetResourceRecordsRequest:
+      type: object
+      properties:
+        domains:
+          type: array
+          items:
+            $ref: '#/components/schemas/DomainEntry'
+      required:
+        - domains
+
+    GetResourceRecordsResponse:
+      type: object
+      properties:
+        result:
+          type: string
+          example: success
+        answer:
+          type: object
+          properties:
+            domains:
+              type: array
+              items:
+                type: object
+                properties:
+                  dname:
+                    type: string
+                  result:
+                    type: string
+                  rrs:
+                    type: array
+                    items:
+                      type: object
+
+    RecordAction:
+      type: object
+      properties:
+        action:
+          type: string
+          description: add_alias | add_record | update_record | remove_record
+        subdomain:
+          type: string
+        ipaddr:
+          type: string
+        ttl:
+          type: integer
+        type:
+          type: string
+
+    UpdateRecordsRequest:
+      type: object
+      properties:
+        domains:
+          type: array
+          items:
+            type: object
+            properties:
+              dname:
+                type: string
+              action_list:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecordAction'
+      required:
+        - domains
+
+    UpdateRecordsResponse:
+      type: object
+      properties:
+        result:
+          type: string
+          example: success
+        answer:
+          type: object
+          properties:
+            domains:
+              type: array
+              items:
+                type: object
+                properties:
+                  dname:
+                    type: string
+                  service_id:
+                    type: integer
+                  action_list:
+                    type: array
+                    items:
+                      type: object
+
+    RemoveRecordRequest:
+      type: object
+      properties:
+        dname:
+          type: string
+        rr_id:
+          type: string
+      required:
+        - dname
+
+    GenericSuccess:
+      type: object
+      properties:
+        result:
+          type: string
+          example: success
+
+    ErrorResponse:
+      type: object
+      properties:
+        result:
+          type: string
+          example: error
+        error:
+          type: string
+        message:
+          type: string
+
+    DiagnosticsResponse:
+      type: object
+      properties:
+        uptime_seconds:
+          type: number
+        queue_depth:
+          type: integer
+        worker_count:
+          type: integer
+        last_regu_heartbeat:
+          type: string
+          format: date-time
+        recent_errors:
+          type: object
+          additionalProperties:
+            type: integer
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: records
+    description: Record lifecycle operations (query/update/remove)
+  - name: diagnostics
+    description: Diagnostics and health
+  - name: admin
+    description: Admin operations (safe-mode)
+
+
