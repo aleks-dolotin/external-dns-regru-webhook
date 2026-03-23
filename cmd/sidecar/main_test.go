@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/adapter"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/health"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/queue"
@@ -604,4 +607,362 @@ func TestApp_DiagnosticsReflectsWorkerCount(t *testing.T) {
 
 	cancel()
 	a.pool.Stop()
+}
+
+// --- Config-driven namespace filtering tests (Story 3.1) ---
+
+// newTestAppWithConfig creates an app wired with a config store loaded from
+// a temporary mappings.yaml. The caller controls the config content.
+func newTestAppWithConfig(t *testing.T, mappingsYAML string) *app {
+	t.Helper()
+	setCredEnv(t, "user", "pass")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "mappings.yaml")
+	if err := os.WriteFile(cfgPath, []byte(mappingsYAML), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+	t.Setenv("REGADAPTER_MAPPINGS_PATH", cfgPath)
+
+	a := newApp()
+	if a.configStore == nil {
+		t.Fatal("expected configStore to be loaded in test app")
+	}
+	return a
+}
+
+const testMappingsYAML = `zones:
+  - zone: example.com
+    namespaces: ["prod","staging"]
+    template: "{{.Name}}.{{.Zone}}"
+    ttl: 300
+  - zone: internal.io
+    namespaces: []
+    template: "{{.Name}}-{{.Namespace}}.{{.Zone}}"
+`
+
+func TestEvents_NamespaceAllowed(t *testing.T) {
+	a := newTestAppWithConfig(t, testMappingsYAML)
+
+	body := `[{
+		"zone":"example.com",
+		"fqdn":"ignored",
+		"record_type":"A",
+		"action":"create",
+		"content":"1.2.3.4",
+		"resource_ref":{"kind":"Ingress","namespace":"prod","name":"web"}
+	}]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rec.Code)
+	}
+
+	var resp eventIntakeResponse
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Accepted != 1 {
+		t.Errorf("expected 1 accepted, got %d", resp.Accepted)
+	}
+	if a.queue.Len() != 1 {
+		t.Errorf("expected 1 in queue, got %d", a.queue.Len())
+	}
+}
+
+func TestEvents_NamespaceRejected(t *testing.T) {
+	a := newTestAppWithConfig(t, testMappingsYAML)
+
+	body := `[{
+		"zone":"example.com",
+		"fqdn":"app.example.com",
+		"record_type":"A",
+		"action":"create",
+		"content":"1.2.3.4",
+		"resource_ref":{"kind":"Ingress","namespace":"dev","name":"web"}
+	}]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	// All events rejected → 400
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 (namespace rejected), got %d", rec.Code)
+	}
+
+	var resp eventIntakeResponse
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Accepted != 0 {
+		t.Errorf("expected 0 accepted, got %d", resp.Accepted)
+	}
+	if resp.Errors != 1 {
+		t.Errorf("expected 1 error, got %d", resp.Errors)
+	}
+	if a.queue.Len() != 0 {
+		t.Errorf("expected empty queue, got %d", a.queue.Len())
+	}
+}
+
+func TestEvents_NamespaceAllowed_EmptyList(t *testing.T) {
+	a := newTestAppWithConfig(t, testMappingsYAML)
+
+	// internal.io has empty namespaces = allow all
+	body := `[{
+		"zone":"internal.io",
+		"fqdn":"ignored",
+		"record_type":"A",
+		"action":"create",
+		"content":"10.0.0.1",
+		"resource_ref":{"kind":"Service","namespace":"anything","name":"svc"}
+	}]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rec.Code)
+	}
+	var resp eventIntakeResponse
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Accepted != 1 {
+		t.Errorf("expected 1 accepted, got %d", resp.Accepted)
+	}
+}
+
+func TestEvents_MixedNamespaces(t *testing.T) {
+	a := newTestAppWithConfig(t, testMappingsYAML)
+
+	body := `[
+		{"zone":"example.com","fqdn":"a","record_type":"A","action":"create","content":"1.1.1.1",
+		 "resource_ref":{"kind":"Ingress","namespace":"prod","name":"app1"}},
+		{"zone":"example.com","fqdn":"b","record_type":"A","action":"create","content":"2.2.2.2",
+		 "resource_ref":{"kind":"Ingress","namespace":"dev","name":"app2"}}
+	]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Errorf("expected 206 (partial), got %d", rec.Code)
+	}
+	var resp eventIntakeResponse
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Accepted != 1 {
+		t.Errorf("expected 1 accepted, got %d", resp.Accepted)
+	}
+	if resp.Errors != 1 {
+		t.Errorf("expected 1 error, got %d", resp.Errors)
+	}
+}
+
+// --- FQDN template rendering tests (Story 3.3) ---
+
+func TestEvents_FQDNTemplateApplied(t *testing.T) {
+	a := newTestAppWithConfig(t, testMappingsYAML)
+
+	body := `[{
+		"zone":"example.com",
+		"fqdn":"original.example.com",
+		"record_type":"A",
+		"action":"create",
+		"content":"1.2.3.4",
+		"resource_ref":{"kind":"Ingress","namespace":"prod","name":"web-frontend"}
+	}]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	// Dequeue and check the FQDN was rendered from template
+	op := a.queue.Dequeue()
+	if op == nil {
+		t.Fatal("expected 1 item in queue")
+	}
+	adapterOp, ok := op.Body.(adapter.Operation)
+	if !ok {
+		t.Fatalf("expected adapter.Operation, got %T", op.Body)
+	}
+	// Template: "{{.Name}}.{{.Zone}}" → "web-frontend.example.com"
+	if adapterOp.Name != "web-frontend.example.com" {
+		t.Errorf("expected FQDN 'web-frontend.example.com', got %q", adapterOp.Name)
+	}
+}
+
+func TestEvents_FQDNTemplateWithNamespace(t *testing.T) {
+	a := newTestAppWithConfig(t, testMappingsYAML)
+
+	body := `[{
+		"zone":"internal.io",
+		"fqdn":"anything",
+		"record_type":"A",
+		"action":"create",
+		"content":"10.0.0.1",
+		"resource_ref":{"kind":"Service","namespace":"kube-system","name":"coredns"}
+	}]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	op := a.queue.Dequeue()
+	if op == nil {
+		t.Fatal("expected 1 item in queue")
+	}
+	adapterOp := op.Body.(adapter.Operation)
+	// Template: "{{.Name}}-{{.Namespace}}.{{.Zone}}" → "coredns-kube-system.internal.io"
+	if adapterOp.Name != "coredns-kube-system.internal.io" {
+		t.Errorf("expected FQDN 'coredns-kube-system.internal.io', got %q", adapterOp.Name)
+	}
+}
+
+func TestEvents_TTLDefaultFromZone(t *testing.T) {
+	a := newTestAppWithConfig(t, testMappingsYAML)
+
+	// Event without TTL → zone default (300) applied
+	body := `[{
+		"zone":"example.com",
+		"fqdn":"x",
+		"record_type":"A",
+		"action":"create",
+		"content":"1.2.3.4",
+		"resource_ref":{"kind":"Ingress","namespace":"prod","name":"app"}
+	}]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	op := a.queue.Dequeue()
+	if op == nil {
+		t.Fatal("expected 1 item in queue")
+	}
+	adapterOp := op.Body.(adapter.Operation)
+	if adapterOp.TTL != 300 {
+		t.Errorf("expected TTL 300 from zone default, got %d", adapterOp.TTL)
+	}
+}
+
+func TestEvents_TTLFromEventPreserved(t *testing.T) {
+	a := newTestAppWithConfig(t, testMappingsYAML)
+
+	// Event with explicit TTL=60 → should NOT be overridden by zone default (300)
+	body := `[{
+		"zone":"example.com",
+		"fqdn":"x",
+		"record_type":"A",
+		"action":"create",
+		"content":"1.2.3.4",
+		"ttl":60,
+		"resource_ref":{"kind":"Ingress","namespace":"prod","name":"app"}
+	}]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	op := a.queue.Dequeue()
+	if op == nil {
+		t.Fatal("expected 1 item in queue")
+	}
+	adapterOp := op.Body.(adapter.Operation)
+	if adapterOp.TTL != 60 {
+		t.Errorf("expected TTL 60 from event, got %d", adapterOp.TTL)
+	}
+}
+
+// --- Graceful degradation: no configStore ---
+
+func TestEvents_NoConfigStore_PassThrough(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	// No REGADAPTER_MAPPINGS_PATH → config load fails → configStore is nil
+	t.Setenv("REGADAPTER_MAPPINGS_PATH", "/nonexistent/path.yaml")
+	a := newApp()
+
+	if a.configStore != nil {
+		t.Fatal("expected nil configStore for nonexistent path")
+	}
+
+	body := `[{"zone":"any.com","fqdn":"app.any.com","record_type":"A","action":"create","content":"1.2.3.4"}]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 (pass-through), got %d", rec.Code)
+	}
+	if a.queue.Len() != 1 {
+		t.Errorf("expected 1 enqueued (pass-through), got %d", a.queue.Len())
+	}
+}
+
+// --- extractLabels helper tests ---
+
+func TestExtractLabels_NilMeta(t *testing.T) {
+	if got := extractLabels(nil); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+func TestExtractLabels_NoLabelsKey(t *testing.T) {
+	meta := map[string]interface{}{"annotations": "x"}
+	if got := extractLabels(meta); got != nil {
+		t.Errorf("expected nil, got %v", got)
+	}
+}
+
+func TestExtractLabels_ValidLabels(t *testing.T) {
+	meta := map[string]interface{}{
+		"labels": map[string]interface{}{
+			"app": "nginx",
+			"env": "prod",
+		},
+	}
+	labels := extractLabels(meta)
+	if labels == nil {
+		t.Fatal("expected non-nil labels")
+	}
+	if labels["app"] != "nginx" {
+		t.Errorf("expected app=nginx, got %q", labels["app"])
+	}
+	if labels["env"] != "prod" {
+		t.Errorf("expected env=prod, got %q", labels["env"])
+	}
+}
+
+func TestExtractLabels_NonStringValues(t *testing.T) {
+	meta := map[string]interface{}{
+		"labels": map[string]interface{}{
+			"count": 42,
+			"name":  "ok",
+		},
+	}
+	labels := extractLabels(meta)
+	if _, ok := labels["count"]; ok {
+		t.Error("non-string label value should be skipped")
+	}
+	if labels["name"] != "ok" {
+		t.Errorf("expected name=ok, got %q", labels["name"])
+	}
+}
+
+func TestExtractLabels_WrongType(t *testing.T) {
+	meta := map[string]interface{}{
+		"labels": "not-a-map",
+	}
+	if got := extractLabels(meta); got != nil {
+		t.Errorf("expected nil for wrong type, got %v", got)
+	}
 }

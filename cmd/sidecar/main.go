@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/config"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/health"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/metrics"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/normalizer"
@@ -25,14 +27,15 @@ import (
 
 // app holds the wired application state, exposed for testing.
 type app struct {
-	mux        *http.ServeMux
-	driver     auth.AuthDriver
-	reloader   *auth.ReloadableDriver // nil when rotation is disabled or initial load failed
-	credsValid *int32                 // 1 = valid, 0 = invalid
-	checker    *health.Checker
-	diagSrc    *diagnosticsSource   // diagnostics data source (Story 10.2)
-	queue      *queue.InMemoryQueue // event queue (Story 2.1)
-	pool       *worker.WorkerPool   // worker pool (Story 2.4)
+	mux         *http.ServeMux
+	driver      auth.AuthDriver
+	reloader    *auth.ReloadableDriver // nil when rotation is disabled or initial load failed
+	credsValid  *int32                 // 1 = valid, 0 = invalid
+	checker     *health.Checker
+	diagSrc     *diagnosticsSource   // diagnostics data source (Story 10.2)
+	queue       *queue.InMemoryQueue // event queue (Story 2.1)
+	pool        *worker.WorkerPool   // worker pool (Story 2.4)
+	configStore *config.Store        // zone-namespace mapping config (Story 3.1)
 }
 
 // diagnosticsSource bridges queue and worker to health.DiagnosticsSource.
@@ -143,11 +146,25 @@ func newApp() *app {
 	// --- event intake endpoint (Story 2.1) ---
 	a.mux.HandleFunc("/adapter/v1/events", a.handleEvents)
 
+	// --- config store: zone-namespace mappings (Story 3.1) ---
+	cfgPath := os.Getenv("REGADAPTER_MAPPINGS_PATH")
+	if cfgPath == "" {
+		cfgPath = "/etc/reg-adapter/mappings.yaml"
+	}
+	cfgStore, err := config.NewStore(cfgPath)
+	if err != nil {
+		log.Printf("WARNING: config store not loaded: %v (will retry via hot-reload)", err)
+	} else {
+		a.configStore = cfgStore
+		log.Printf("config store loaded: %d zone mappings from %s", len(cfgStore.Get().Zones), cfgPath)
+	}
+
 	return a
 }
 
 // handleEvents accepts POST requests with ExternalDNS events, normalizes
-// them into adapter.Operation payloads, and enqueues for processing.
+// them into adapter.Operation payloads, filters by zone-namespace mapping
+// (Story 3.1), applies FQDN templates (Story 3.3), and enqueues for processing.
 func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -162,16 +179,51 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	ops, errs := normalizer.NormalizeBatch(events)
 
-	// Enqueue valid operations.
+	// Enqueue valid operations, applying config rules when configStore is loaded.
+	var accepted int
 	for i := range ops {
+		// Story 3.1: enforce zone-namespace mapping when config is available.
+		if a.configStore != nil {
+			zone := ops[i].Zone
+			namespace := ops[i].ResourceRef.Namespace
+
+			if !a.configStore.IsNamespaceAllowed(zone, namespace) {
+				errs = append(errs, fmt.Errorf("op %s: namespace %q not allowed for zone %q",
+					ops[i].OpID, namespace, zone))
+				continue
+			}
+
+			// Story 3.3: apply FQDN template from zone mapping.
+			zm := a.configStore.FindZone(zone)
+			if zm != nil {
+				labels := extractLabels(ops[i].K8sMeta)
+				fqdn, err := config.RenderFQDNForZone(zm, ops[i].ResourceRef.Name, namespace, labels)
+				if err != nil {
+					log.Printf("WARNING: FQDN template failed for op %s: %v (keeping original FQDN)",
+						ops[i].OpID, err)
+				} else {
+					ops[i].Name = fqdn
+				}
+
+				// Apply TTL/priority defaults from zone mapping when not set on event.
+				if ops[i].TTL == 0 && zm.TTL > 0 {
+					ops[i].TTL = zm.TTL
+				}
+				if ops[i].Priority == 0 && zm.Priority > 0 {
+					ops[i].Priority = zm.Priority
+				}
+			}
+		}
+
 		a.queue.Enqueue(queue.Operation{
 			ID:   ops[i].OpID,
 			Body: ops[i],
 		})
+		accepted++
 	}
 
 	resp := eventIntakeResponse{
-		Accepted: len(ops),
+		Accepted: accepted,
 		Errors:   len(errs),
 	}
 	for _, e := range errs {
@@ -179,7 +231,7 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code := http.StatusOK
-	if len(errs) > 0 && len(ops) == 0 {
+	if len(errs) > 0 && accepted == 0 {
 		code = http.StatusBadRequest
 	} else if len(errs) > 0 {
 		code = http.StatusPartialContent // 206: some accepted, some rejected
@@ -187,6 +239,28 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// extractLabels safely extracts string labels from K8sMeta["labels"].
+func extractLabels(meta map[string]interface{}) map[string]string {
+	if meta == nil {
+		return nil
+	}
+	raw, ok := meta["labels"]
+	if !ok {
+		return nil
+	}
+	m, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	labels := make(map[string]string, len(m))
+	for k, v := range m {
+		if s, ok := v.(string); ok {
+			labels[k] = s
+		}
+	}
+	return labels
 }
 
 // eventIntakeResponse is returned by POST /adapter/v1/events.
@@ -239,6 +313,11 @@ func main() {
 
 	if a.reloader != nil {
 		go a.reloader.Run(ctx)
+	}
+
+	// Start config hot-reload loop (Story 3.1).
+	if a.configStore != nil {
+		go a.configStore.RunReloader(ctx.Done(), config.DefaultReloadInterval)
 	}
 
 	// Start worker pool with configurable concurrency (Story 2.4).
