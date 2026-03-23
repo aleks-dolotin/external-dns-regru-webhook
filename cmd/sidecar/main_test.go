@@ -6,9 +6,11 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/health"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/queue"
 )
 
 // setCredEnv uses t.Setenv for automatic cleanup after test.
@@ -226,5 +228,127 @@ func TestRotationInterval_Invalid(t *testing.T) {
 	d := rotationInterval()
 	if d != auth.DefaultRotationInterval {
 		t.Errorf("expected default for invalid input, got %v", d)
+	}
+}
+
+// --- Diagnostics endpoint tests (Story 10.2) ---
+
+func TestDiagnostics_EndpointRegistered(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	req := httptest.NewRequest(http.MethodGet, "/adapter/v1/diagnostics", nil)
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("/adapter/v1/diagnostics: expected 200, got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type 'application/json', got %q", ct)
+	}
+
+	var resp health.DiagnosticsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode diagnostics response: %v", err)
+	}
+	// With no queue/worker wired, expect zero values
+	if resp.QueueDepth != 0 {
+		t.Errorf("expected queue_depth 0, got %d", resp.QueueDepth)
+	}
+	if resp.WorkerCount != 0 {
+		t.Errorf("expected worker_count 0, got %d", resp.WorkerCount)
+	}
+	if resp.LastHeartbeat != nil {
+		t.Error("expected nil last_heartbeat with no worker pool")
+	}
+	if resp.Zones != nil {
+		t.Error("expected nil zones with no worker pool")
+	}
+	if resp.Timestamp.IsZero() {
+		t.Error("expected non-zero timestamp")
+	}
+}
+
+func TestDiagnostics_EndpointRegistered_NoCreds(t *testing.T) {
+	setCredEnv(t, "", "")
+	a := newApp()
+
+	req := httptest.NewRequest(http.MethodGet, "/adapter/v1/diagnostics", nil)
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	// Diagnostics should work regardless of credential state
+	if rec.Code != http.StatusOK {
+		t.Errorf("/adapter/v1/diagnostics without creds: expected 200, got %d", rec.Code)
+	}
+}
+
+func TestDiagnostics_DiagSrcPresent(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	if a.diagSrc == nil {
+		t.Fatal("expected non-nil diagSrc in app")
+	}
+}
+
+func TestDiagnosticsSource_NilSafe(t *testing.T) {
+	src := &diagnosticsSource{}
+
+	if src.QueueDepth() != 0 {
+		t.Errorf("expected QueueDepth 0 with nil queue, got %d", src.QueueDepth())
+	}
+	if src.WorkerCount() != 0 {
+		t.Errorf("expected WorkerCount 0 with nil pool, got %d", src.WorkerCount())
+	}
+	if !src.LastHeartbeat().IsZero() {
+		t.Error("expected zero LastHeartbeat with nil pool")
+	}
+	if src.ZoneErrors() != nil {
+		t.Error("expected nil ZoneErrors with nil pool")
+	}
+}
+
+func TestDiagnosticsSource_WithQueue(t *testing.T) {
+	q := queue.New()
+	q.Enqueue(queue.Operation{ID: "op1"})
+	q.Enqueue(queue.Operation{ID: "op2"})
+
+	src := &diagnosticsSource{q: q}
+
+	if depth := src.QueueDepth(); depth != 2 {
+		t.Errorf("expected QueueDepth 2, got %d", depth)
+	}
+	// worker-related methods still nil-safe
+	if src.WorkerCount() != 0 {
+		t.Errorf("expected WorkerCount 0 with nil pool")
+	}
+	if !src.LastHeartbeat().IsZero() {
+		t.Error("expected zero LastHeartbeat with nil pool")
+	}
+}
+
+func TestDiagnosticsSource_ImplementsInterface(t *testing.T) {
+	// Compile-time check that diagnosticsSource implements health.DiagnosticsSource
+	var _ health.DiagnosticsSource = (*diagnosticsSource)(nil)
+}
+
+func TestDiagnostics_ResponseTimestamp(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	before := time.Now().UTC().Add(-time.Second)
+	req := httptest.NewRequest(http.MethodGet, "/adapter/v1/diagnostics", nil)
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+	after := time.Now().UTC().Add(time.Second)
+
+	var resp health.DiagnosticsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if resp.Timestamp.Before(before) || resp.Timestamp.After(after) {
+		t.Errorf("timestamp %v not in expected range [%v, %v]", resp.Timestamp, before, after)
 	}
 }

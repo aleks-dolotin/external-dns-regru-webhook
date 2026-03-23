@@ -13,6 +13,8 @@ import (
 
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/health"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/queue"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/worker"
 )
 
 // app holds the wired application state, exposed for testing.
@@ -22,6 +24,53 @@ type app struct {
 	reloader   *auth.ReloadableDriver // nil when rotation is disabled or initial load failed
 	credsValid *int32                 // 1 = valid, 0 = invalid
 	checker    *health.Checker
+	diagSrc    *diagnosticsSource // diagnostics data source (Story 10.2)
+}
+
+// diagnosticsSource bridges queue and worker to health.DiagnosticsSource.
+// Nil-safe: returns zero values when components are not yet wired.
+type diagnosticsSource struct {
+	q *queue.InMemoryQueue
+	p *worker.WorkerPool
+}
+
+func (d *diagnosticsSource) QueueDepth() int {
+	if d.q == nil {
+		return 0
+	}
+	return d.q.Len()
+}
+
+func (d *diagnosticsSource) WorkerCount() int {
+	if d.p == nil {
+		return 0
+	}
+	return d.p.WorkerCount()
+}
+
+func (d *diagnosticsSource) LastHeartbeat() time.Time {
+	if d.p == nil {
+		return time.Time{}
+	}
+	return d.p.LastHeartbeat()
+}
+
+func (d *diagnosticsSource) ZoneErrors() map[string]health.ZoneErrorInfo {
+	if d.p == nil {
+		return nil
+	}
+	errs := d.p.LastErrors()
+	if len(errs) == 0 {
+		return nil
+	}
+	result := make(map[string]health.ZoneErrorInfo, len(errs))
+	for zone, ze := range errs {
+		result[zone] = health.ZoneErrorInfo{
+			Message: ze.Message,
+			Time:    ze.Time,
+		}
+	}
+	return result
 }
 
 // newApp loads credentials via NewDriverFromEnv, optionally wraps in
@@ -72,6 +121,11 @@ func newApp() *app {
 
 	// /ready — readiness: OK only when all checks pass, JSON body.
 	a.mux.HandleFunc("/ready", a.checker.ReadyHandler)
+
+	// --- diagnostics endpoint (Story 10.2) ---
+	// Wire queue/worker into diagSrc when Epic 2 is implemented.
+	a.diagSrc = &diagnosticsSource{}
+	a.mux.HandleFunc("/adapter/v1/diagnostics", health.DiagnosticsHandler(a.diagSrc))
 
 	return a
 }
