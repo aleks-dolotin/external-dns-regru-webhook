@@ -2,7 +2,43 @@ REPO_ROOT := $(shell pwd)
 MOCK_LOG := /tmp/mock-regu.log
 MOCK_PID := /tmp/mock-regu.pid
 
-.PHONY: mock-start mock-stop mock-status test-integration validate-openapi k8s-apply k8s-destroy
+.PHONY: test test-verbose test-cover test-race lint vet build \
+       mock-start mock-stop mock-status test-integration validate-openapi k8s-apply k8s-destroy
+
+## ---------- Go build & quality ----------
+
+build:
+	@echo "Building sidecar..."
+	go build -o bin/sidecar ./cmd/sidecar
+
+test:
+	@echo "Running Go unit tests..."
+	go test ./...
+
+test-verbose:
+	@echo "Running Go unit tests (verbose)..."
+	go test -v ./...
+
+test-race:
+	@echo "Running Go unit tests with race detector..."
+	go test -race ./...
+
+test-cover:
+	@echo "Running Go unit tests with coverage..."
+	go test -coverprofile=coverage.out ./...
+	go tool cover -func=coverage.out
+	@echo "HTML report: go tool cover -html=coverage.out"
+
+vet:
+	@echo "Running go vet..."
+	go vet ./...
+
+lint:
+	@echo "Running golangci-lint..."
+	@which golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found — install: https://golangci-lint.run/usage/install/"; exit 1; }
+	golangci-lint run ./...
+
+## ---------- Mock server & integration ----------
 
 mock-start:
 	@echo "Starting mock Reg.ru server..."
