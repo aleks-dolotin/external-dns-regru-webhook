@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -17,28 +18,38 @@ import (
 type app struct {
 	mux        *http.ServeMux
 	driver     auth.AuthDriver
-	credsValid *int32 // 1 = valid, 0 = invalid
+	reloader   *auth.ReloadableDriver // nil when rotation is disabled or initial load failed
+	credsValid *int32                 // 1 = valid, 0 = invalid
 }
 
-// newApp loads credentials via EnvSecretProvider, builds the HTTP mux,
-// and wires /ready to credential validity. This is the single source of
-// truth for application setup — both main() and tests use it.
+// newApp loads credentials via NewDriverFromEnv, optionally wraps in
+// ReloadableDriver for hot rotation, builds the HTTP mux, and wires
+// /ready to credential validity.
 func newApp() *app {
 	a := &app{
 		mux:        http.NewServeMux(),
 		credsValid: new(int32),
 	}
 
-	// --- credential loading ---
-	provider := &auth.EnvSecretProvider{}
-	creds, err := provider.LoadCredentials()
+	// --- driver loading via pluggable factory ---
+	driver, err := auth.NewDriverFromEnv()
 	if err != nil {
-		log.Printf("WARNING: credentials not available: %v (adapter will not be ready)", err)
-		// NOTE: credential values are never printed — only presence/absence is logged (NFR-Sec1).
+		log.Printf("WARNING: auth driver not available: %v (adapter will not be ready)", err)
 	} else {
 		atomic.StoreInt32(a.credsValid, 1)
-		log.Println("credentials loaded successfully")
-		a.driver = &auth.TokenDriver{Creds: creds}
+		log.Printf("auth driver loaded successfully (type: %s)", os.Getenv(auth.EnvAuthDriver))
+
+		// --- credential rotation ---
+		interval := rotationInterval()
+		rd := auth.NewReloadableDriver(driver, interval)
+		rd.OnReload = func(_ auth.AuthDriver) {
+			atomic.StoreInt32(a.credsValid, 1)
+		}
+		rd.OnReloadError = func(e error) {
+			log.Printf("credential reload failed (old creds still active): %v", e)
+		}
+		a.reloader = rd
+		a.driver = rd // adapter uses reloadable wrapper
 	}
 
 	// /healthz — liveness: always OK (process is running).
@@ -58,12 +69,33 @@ func newApp() *app {
 	return a
 }
 
+// rotationInterval reads REGU_ROTATION_INTERVAL_SEC from env; defaults to 30s.
+func rotationInterval() time.Duration {
+	s := os.Getenv("REGU_ROTATION_INTERVAL_SEC")
+	if s == "" {
+		return auth.DefaultRotationInterval
+	}
+	sec, err := strconv.Atoi(s)
+	if err != nil || sec <= 0 {
+		return auth.DefaultRotationInterval
+	}
+	return time.Duration(sec) * time.Second
+}
+
 func main() {
 	a := newApp()
 
 	srv := &http.Server{
 		Addr:    ":8080",
 		Handler: a.mux,
+	}
+
+	// Start credential rotation loop if reloader is available.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if a.reloader != nil {
+		go a.reloader.Run(ctx)
 	}
 
 	go func() {
@@ -73,14 +105,12 @@ func main() {
 		}
 	}()
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	<-ctx.Done()
 	log.Println("sidecar shutting down...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
 	log.Println("sidecar stopped")

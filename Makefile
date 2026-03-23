@@ -2,7 +2,7 @@ REPO_ROOT := $(shell pwd)
 MOCK_LOG := /tmp/mock-regu.log
 MOCK_PID := /tmp/mock-regu.pid
 
-.PHONY: test test-verbose test-cover test-race lint vet build \
+.PHONY: test test-verbose test-all test-cover test-race lint vet build \
        setup-hooks pre-commit \
        mock-start mock-stop mock-status test-integration validate-openapi k8s-apply k8s-destroy
 
@@ -19,6 +19,10 @@ test:
 test-verbose:
 	@echo "Running Go unit tests (verbose)..."
 	go test -v ./...
+
+test-all:
+	@echo "Running all Go tests (verbose, no cache)..."
+	go test -v -count=1 ./...
 
 test-race:
 	@echo "Running Go unit tests with race detector..."

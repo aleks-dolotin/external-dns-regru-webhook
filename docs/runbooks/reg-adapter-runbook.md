@@ -184,4 +184,90 @@ Notes
 - Replace placeholders with real values from your cluster and infra.
 - This is a short operational playbook — expand incident-specific runbooks in `docs/incidents/` with postmortems and checklists.
 
+---
+
+## Credential Setup & Minimum Permissions (Least-Privilege)
+
+### Minimum Required Reg.ru API Permissions
+
+The adapter requires **only zone-management permissions**. Do **not** use admin-level credentials.
+
+| Permission / API Function | Required | Purpose |
+|---|---|---|
+| `zone/get_resource_records` | ✅ Yes | Read DNS records for a zone |
+| `zone/update_records` | ✅ Yes | Create, update, delete DNS records (via action_list) |
+| `zone/add_txt`, `zone/add_aaaa`, etc. | ❌ No | Not used — adapter uses `update_records` for all mutations |
+| `service/get_list` | ❌ No | Not required for DNS operations |
+| Domain transfer / registration | ❌ No | Not required |
+| Billing / payment operations | ❌ No | Not required |
+
+### Credential Types
+
+| Auth Mode | Env Variables | Notes |
+|---|---|---|
+| **Token** (default) | `REGU_USERNAME`, `REGU_PASSWORD` | Simple username + API password |
+| **RSA Signature** | `REGU_USERNAME`, `REGU_RSA_PRIVATE_KEY` or `REGU_RSA_PRIVATE_KEY_PATH` | Set `AUTH_DRIVER=rsa` |
+
+### Setting Up Credentials in Kubernetes
+
+1. Create a dedicated Reg.ru API user with **only** `zone/get_resource_records` and `zone/update_records` permissions.
+
+2. Create the Kubernetes Secret:
+```bash
+kubectl -n <NAMESPACE> create secret generic reg-credentials \
+  --from-literal=username=<REGU_USERNAME> \
+  --from-literal=password=<REGU_PASSWORD>
+```
+
+3. For RSA auth, mount the private key:
+```bash
+kubectl -n <NAMESPACE> create secret generic reg-credentials \
+  --from-literal=username=<REGU_USERNAME> \
+  --from-file=rsa-key=<PATH_TO_PRIVATE_KEY_PEM>
+```
+
+### Credential Rotation
+
+The adapter supports **live rotation without pod restart** via `ReloadableDriver`:
+- Credentials are mounted as files from the K8s Secret volume at `REGU_CREDENTIALS_PATH`
+- The kubelet automatically updates mounted secret files when the Secret object changes (sync period ~60s by default)
+- The adapter's `ReloadableDriver` re-reads files on every tick (default: **30 seconds**)
+- During rotation, old credentials continue serving requests until new ones are verified
+- **Zero downtime** — no requests fail during rotation
+
+> **Important:** This works because credentials are mounted as volume files, NOT via `secretKeyRef` env vars. Env vars are immutable after pod start — only file mounts support live rotation.
+
+Configurable via environment variable:
+- `REGU_ROTATION_INTERVAL_SEC` — interval in seconds between re-reads (default: 30)
+
+Rotation procedure:
+```bash
+# 1. Update the secret with new credentials
+kubectl -n <NAMESPACE> create secret generic reg-credentials \
+  --from-literal=username=<NEW_USERNAME> \
+  --from-literal=password=<NEW_PASSWORD> \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 2. Wait for kubelet sync (~60s) + adapter reload (~30s) = ~90s max
+# 3. Verify /ready returns 200
+curl -s http://reg-adapter.<NAMESPACE>.svc.cluster.local:8080/ready
+
+# 4. (Optional) Check adapter logs for "credentials reloaded successfully"
+kubectl -n <NAMESPACE> logs -l app.kubernetes.io/name=reg-adapter --since=2m | grep "reloaded"
+```
+
+Fallback (if file mount is not configured):
+- Set `REGU_USERNAME` and `REGU_PASSWORD` as env vars (requires pod restart for rotation)
+- The adapter reads env vars as a fallback when `REGU_CREDENTIALS_PATH` is not set
+
+### Permission Error Handling
+
+The adapter classifies permission errors clearly:
+- **HTTP 403** → `ErrPermissionDenied` — credentials lack required zone-management permissions
+- **HTTP 401** → `ErrAuthenticationFailed` — credentials are invalid or expired
+- **API error `ACCESS_DENIED_TO_OBJECT`** → `ErrPermissionDenied` — user lacks access to the specific zone
+- **API error `INVALID_AUTH`** → `ErrAuthenticationFailed` — authentication rejected by Reg.ru
+
+If you see permission errors in logs, verify the API user has the minimum permissions listed above.
+
 

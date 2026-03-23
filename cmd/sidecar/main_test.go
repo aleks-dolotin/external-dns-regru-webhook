@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+
+	"github.com/yourorg/externaldns-regru-sidecar/internal/auth"
 )
 
 // setCredEnv uses t.Setenv for automatic cleanup after test.
@@ -17,7 +19,7 @@ func setCredEnv(t *testing.T, username, password string) {
 func TestReady_ValidCredentials(t *testing.T) {
 	setCredEnv(t, "user", "pass")
 
-	a := newApp() // exercises real EnvSecretProvider + atomic wiring
+	a := newApp()
 
 	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
 	rec := httptest.NewRecorder()
@@ -31,6 +33,20 @@ func TestReady_ValidCredentials(t *testing.T) {
 	}
 	if a.driver == nil {
 		t.Error("expected non-nil AuthDriver when credentials are valid")
+	}
+}
+
+func TestReady_ValidCredentials_ReloadableDriver(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+
+	a := newApp()
+
+	if a.reloader == nil {
+		t.Fatal("expected non-nil reloader when credentials are valid")
+	}
+	// driver should be the reloadable wrapper
+	if _, ok := a.driver.(*auth.ReloadableDriver); !ok {
+		t.Errorf("expected driver to be *auth.ReloadableDriver, got %T", a.driver)
 	}
 }
 
@@ -51,6 +67,9 @@ func TestReady_MissingCredentials(t *testing.T) {
 	}
 	if a.driver != nil {
 		t.Error("expected nil AuthDriver when credentials are missing")
+	}
+	if a.reloader != nil {
+		t.Error("expected nil reloader when credentials are missing")
 	}
 }
 
@@ -107,5 +126,29 @@ func TestHealthz_AlwaysOK_WithoutCreds(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("/healthz without creds: expected 200, got %d", rec.Code)
+	}
+}
+
+func TestRotationInterval_Default(t *testing.T) {
+	t.Setenv("REGU_ROTATION_INTERVAL_SEC", "")
+	d := rotationInterval()
+	if d != auth.DefaultRotationInterval {
+		t.Errorf("expected %v, got %v", auth.DefaultRotationInterval, d)
+	}
+}
+
+func TestRotationInterval_Custom(t *testing.T) {
+	t.Setenv("REGU_ROTATION_INTERVAL_SEC", "60")
+	d := rotationInterval()
+	if d.Seconds() != 60 {
+		t.Errorf("expected 60s, got %v", d)
+	}
+}
+
+func TestRotationInterval_Invalid(t *testing.T) {
+	t.Setenv("REGU_ROTATION_INTERVAL_SEC", "notanumber")
+	d := rotationInterval()
+	if d != auth.DefaultRotationInterval {
+		t.Errorf("expected default for invalid input, got %v", d)
 	}
 }

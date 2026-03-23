@@ -25,19 +25,14 @@ spec:
           env:
             - name: CONFIG_PATH
               value: "/etc/reg-adapter/config/mappings.yaml"
-            - name: REGU_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  name: reg-credentials
-                  key: username
-            - name: REGU_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: reg-credentials
-                  key: password
+            - name: REGU_CREDENTIALS_PATH
+              value: "/etc/reg-adapter/secrets"
           volumeMounts:
             - name: config
               mountPath: /etc/reg-adapter/config
+              readOnly: true
+            - name: credentials
+              mountPath: /etc/reg-adapter/secrets
               readOnly: true
           resources:
             requests:
@@ -64,4 +59,6 @@ spec:
         - name: config
           configMap:
             name: reg-adapter-config
-
+        - name: credentials
+          secret:
+            secretName: reg-credentials
