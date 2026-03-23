@@ -1,12 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 
-	"github.com/yourorg/externaldns-regru-sidecar/internal/auth"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/health"
 )
 
 // setCredEnv uses t.Setenv for automatic cleanup after test.
@@ -33,6 +35,15 @@ func TestReady_ValidCredentials(t *testing.T) {
 	}
 	if a.driver == nil {
 		t.Error("expected non-nil AuthDriver when credentials are valid")
+	}
+
+	// Verify JSON response
+	var resp health.ReadyResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+	if resp.Status != health.StatusOK {
+		t.Errorf("expected status 'ok', got %q", resp.Status)
 	}
 }
 
@@ -70,6 +81,25 @@ func TestReady_MissingCredentials(t *testing.T) {
 	}
 	if a.reloader != nil {
 		t.Error("expected nil reloader when credentials are missing")
+	}
+
+	// Verify JSON response with fail status
+	var resp health.ReadyResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+	if resp.Status != health.StatusFail {
+		t.Errorf("expected status 'fail', got %q", resp.Status)
+	}
+	// credentials check should be failed
+	found := false
+	for _, ch := range resp.Checks {
+		if ch.Name == "credentials" && ch.Status == health.StatusFail {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected 'credentials' check with status 'fail'")
 	}
 }
 
@@ -113,6 +143,14 @@ func TestHealthz_AlwaysOK_WithCreds(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("/healthz with creds: expected 200, got %d", rec.Code)
 	}
+	// Verify JSON response
+	var resp health.HealthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+	if resp.Status != health.StatusOK {
+		t.Errorf("expected status 'ok', got %q", resp.Status)
+	}
 }
 
 func TestHealthz_AlwaysOK_WithoutCreds(t *testing.T) {
@@ -126,6 +164,44 @@ func TestHealthz_AlwaysOK_WithoutCreds(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("/healthz without creds: expected 200, got %d", rec.Code)
+	}
+}
+
+func TestHealthz_JSONContentType(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+
+	a := newApp()
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type 'application/json', got %q", ct)
+	}
+}
+
+func TestReady_JSONContentType(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+
+	a := newApp()
+
+	req := httptest.NewRequest(http.MethodGet, "/ready", nil)
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type 'application/json', got %q", ct)
+	}
+}
+
+func TestReady_CheckerPresent(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+
+	a := newApp()
+
+	if a.checker == nil {
+		t.Fatal("expected non-nil health.Checker in app")
 	}
 }
 

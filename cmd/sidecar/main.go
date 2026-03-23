@@ -11,7 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yourorg/externaldns-regru-sidecar/internal/auth"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/health"
 )
 
 // app holds the wired application state, exposed for testing.
@@ -20,6 +21,7 @@ type app struct {
 	driver     auth.AuthDriver
 	reloader   *auth.ReloadableDriver // nil when rotation is disabled or initial load failed
 	credsValid *int32                 // 1 = valid, 0 = invalid
+	checker    *health.Checker
 }
 
 // newApp loads credentials via NewDriverFromEnv, optionally wraps in
@@ -52,19 +54,24 @@ func newApp() *app {
 		a.driver = rd // adapter uses reloadable wrapper
 	}
 
-	// /healthz — liveness: always OK (process is running).
-	a.mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
+	// --- health checker with readiness sub-checks ---
+	a.checker = health.NewChecker(
+		health.ReadyCheck{
+			Name: "credentials",
+			Check: func() (bool, string) {
+				if atomic.LoadInt32(a.credsValid) == 1 {
+					return true, ""
+				}
+				return false, "credentials not available"
+			},
+		},
+	)
 
-	// /ready — readiness: OK only when credentials are valid.
-	a.mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		if atomic.LoadInt32(a.credsValid) == 1 {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		http.Error(w, "credentials not available", http.StatusServiceUnavailable)
-	})
+	// /healthz — liveness: always OK (process is running), JSON body.
+	a.mux.HandleFunc("/healthz", a.checker.HealthzHandler)
+
+	// /ready — readiness: OK only when all checks pass, JSON body.
+	a.mux.HandleFunc("/ready", a.checker.ReadyHandler)
 
 	return a
 }

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yourorg/externaldns-regru-sidecar/internal/auth"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
 )
 
 // ErrPermissionDenied is returned when the API responds with a permission/authorization error.

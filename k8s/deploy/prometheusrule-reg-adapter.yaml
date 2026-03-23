@@ -1,0 +1,67 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: reg-adapter-alerts
+  namespace: reg-adapter
+  labels:
+    app.kubernetes.io/name: reg-adapter
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: reg-adapter.rules
+      rules:
+        # Alert: readiness probe failing for more than 2 minutes
+        - alert: RegAdapterNotReady
+          expr: |
+            kube_deployment_status_ready_replicas{deployment="reg-adapter"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Reg Adapter is not ready"
+            description: "All reg-adapter replicas have been not-ready for more than 2 minutes. Check /ready endpoint and credentials."
+            runbook_url: "https://github.com/aleks-dolotin/external-dns-regru-webhook/blob/main/docs/runbooks/reg-adapter-runbook.md#incident-b--authentication-failure-invalid-credentials--signature-errors"
+
+        # Alert: high API error rate (>5% over 5 minutes)
+        - alert: RegAdapterHighErrorRate
+          expr: |
+            (
+              sum(rate(regru_api_requests_total{outcome="error"}[5m]))
+              /
+              sum(rate(regru_api_requests_total[5m]))
+            ) > 0.05
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Reg Adapter error rate exceeds 5%"
+            description: "Reg.ru API error rate is {{ $value | humanizePercentage }} over the last 5 minutes."
+            runbook_url: "https://github.com/aleks-dolotin/external-dns-regru-webhook/blob/main/docs/runbooks/reg-adapter-runbook.md#incident-a--rate-limit-surge--many-429-responses"
+
+        # Alert: queue depth too high (>1000 items)
+        - alert: RegAdapterQueueBacklog
+          expr: |
+            regru_queue_depth > 1000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Reg Adapter queue backlog exceeds 1000"
+            description: "Queue depth is {{ $value }} for more than 5 minutes. Workers may be unable to keep up."
+            runbook_url: "https://github.com/aleks-dolotin/external-dns-regru-webhook/blob/main/docs/runbooks/reg-adapter-runbook.md#incident-e--queue-backlog-and-worker-lag"
+
+        # Alert: Reg.ru API completely unavailable (all requests failing)
+        - alert: RegAdapterAPIUnavailable
+          expr: |
+            sum(rate(regru_api_requests_total{outcome="success"}[5m])) == 0
+            and
+            sum(rate(regru_api_requests_total[5m])) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Reg.ru API is unavailable"
+            description: "No successful API requests in the last 5 minutes while requests are being made."
+            runbook_url: "https://github.com/aleks-dolotin/external-dns-regru-webhook/blob/main/docs/runbooks/reg-adapter-runbook.md#incident-c--regru-outage--large-scale-5xx"
+

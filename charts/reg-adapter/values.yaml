@@ -55,4 +55,10 @@ secret:
 prometheus:
   serviceMonitor:
     enabled: true
+  alerts:
+    enabled: true
+    readinessFailureMinutes: 2
+    errorRateThreshold: "0.05"
+    queueDepthThreshold: 1000
+    runbookBaseURL: "https://github.com/aleks-dolotin/external-dns-regru-webhook/blob/main"
 
