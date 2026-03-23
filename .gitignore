@@ -8,6 +8,7 @@
 _bmad/
 _bmad-output/
 .playwright-mcp/
+CLAUDE.md
 
 # Build artifacts
 bin/
