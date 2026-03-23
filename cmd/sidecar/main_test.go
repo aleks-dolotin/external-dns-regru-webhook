@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -351,4 +353,255 @@ func TestDiagnostics_ResponseTimestamp(t *testing.T) {
 	if resp.Timestamp.Before(before) || resp.Timestamp.After(after) {
 		t.Errorf("timestamp %v not in expected range [%v, %v]", resp.Timestamp, before, after)
 	}
+}
+
+// --- Event intake endpoint tests (Story 2.1) ---
+
+func TestEvents_ValidBatch(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	body := `[
+		{"zone":"example.com","fqdn":"app.example.com","record_type":"A","action":"create","content":"1.2.3.4"},
+		{"zone":"example.com","fqdn":"api.example.com","record_type":"CNAME","action":"update","content":"lb.example.com"}
+	]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rec.Code)
+	}
+
+	var resp eventIntakeResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if resp.Accepted != 2 {
+		t.Errorf("expected 2 accepted, got %d", resp.Accepted)
+	}
+	if resp.Errors != 0 {
+		t.Errorf("expected 0 errors, got %d", resp.Errors)
+	}
+
+	// Verify items were enqueued
+	if a.queue.Len() != 2 {
+		t.Errorf("expected queue length 2, got %d", a.queue.Len())
+	}
+}
+
+func TestEvents_PartialErrors(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	body := `[
+		{"zone":"example.com","fqdn":"app.example.com","record_type":"A","action":"create"},
+		{"zone":"","fqdn":"bad.example.com","record_type":"A","action":"create"}
+	]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Errorf("expected 206 Partial Content, got %d", rec.Code)
+	}
+
+	var resp eventIntakeResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if resp.Accepted != 1 {
+		t.Errorf("expected 1 accepted, got %d", resp.Accepted)
+	}
+	if resp.Errors != 1 {
+		t.Errorf("expected 1 error, got %d", resp.Errors)
+	}
+	if len(resp.ErrorDetails) != 1 {
+		t.Errorf("expected 1 error detail, got %d", len(resp.ErrorDetails))
+	}
+	if a.queue.Len() != 1 {
+		t.Errorf("expected queue length 1, got %d", a.queue.Len())
+	}
+}
+
+func TestEvents_AllInvalid(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	body := `[{"zone":"","fqdn":"","record_type":"","action":""}]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for all invalid, got %d", rec.Code)
+	}
+	if a.queue.Len() != 0 {
+		t.Errorf("expected empty queue, got %d", a.queue.Len())
+	}
+}
+
+func TestEvents_InvalidJSON(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString("not json"))
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid JSON, got %d", rec.Code)
+	}
+}
+
+func TestEvents_MethodNotAllowed(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	req := httptest.NewRequest(http.MethodGet, "/adapter/v1/events", nil)
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for GET, got %d", rec.Code)
+	}
+}
+
+func TestEvents_EmptyArray(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString("[]"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 for empty array, got %d", rec.Code)
+	}
+	var resp eventIntakeResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if resp.Accepted != 0 {
+		t.Errorf("expected 0 accepted, got %d", resp.Accepted)
+	}
+}
+
+func TestEvents_QueuePresent(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	if a.queue == nil {
+		t.Fatal("expected non-nil queue in app")
+	}
+}
+
+func TestEvents_DiagnosticsReflectsQueue(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	// Enqueue an event
+	body := `[{"zone":"example.com","fqdn":"app.example.com","record_type":"A","action":"create","content":"1.2.3.4"}]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("event intake failed: %d", rec.Code)
+	}
+
+	// Now check diagnostics
+	req = httptest.NewRequest(http.MethodGet, "/adapter/v1/diagnostics", nil)
+	rec = httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	var diag health.DiagnosticsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&diag); err != nil {
+		t.Fatalf("decode diagnostics error: %v", err)
+	}
+	if diag.QueueDepth != 1 {
+		t.Errorf("expected queue_depth 1 after event intake, got %d", diag.QueueDepth)
+	}
+}
+
+// --- Worker pool concurrency tests (Story 2.4) ---
+
+func TestWorkerConcurrency_Default(t *testing.T) {
+	t.Setenv("WORKER_CONCURRENCY", "")
+	n := workerConcurrency()
+	if n != DefaultWorkerConcurrency {
+		t.Errorf("expected %d, got %d", DefaultWorkerConcurrency, n)
+	}
+}
+
+func TestWorkerConcurrency_Custom(t *testing.T) {
+	t.Setenv("WORKER_CONCURRENCY", "8")
+	n := workerConcurrency()
+	if n != 8 {
+		t.Errorf("expected 8, got %d", n)
+	}
+}
+
+func TestWorkerConcurrency_Invalid(t *testing.T) {
+	t.Setenv("WORKER_CONCURRENCY", "abc")
+	n := workerConcurrency()
+	if n != DefaultWorkerConcurrency {
+		t.Errorf("expected default for invalid input, got %d", n)
+	}
+}
+
+func TestWorkerConcurrency_Zero(t *testing.T) {
+	t.Setenv("WORKER_CONCURRENCY", "0")
+	n := workerConcurrency()
+	if n != DefaultWorkerConcurrency {
+		t.Errorf("expected default for zero, got %d", n)
+	}
+}
+
+func TestWorkerConcurrency_Negative(t *testing.T) {
+	t.Setenv("WORKER_CONCURRENCY", "-3")
+	n := workerConcurrency()
+	if n != DefaultWorkerConcurrency {
+		t.Errorf("expected default for negative, got %d", n)
+	}
+}
+
+func TestApp_PoolPresent(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	if a.pool == nil {
+		t.Fatal("expected non-nil worker pool in app")
+	}
+}
+
+func TestApp_DiagnosticsReflectsWorkerCount(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	// Start pool with 3 workers
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a.pool.Start(ctx, 3)
+	time.Sleep(50 * time.Millisecond)
+
+	req := httptest.NewRequest(http.MethodGet, "/adapter/v1/diagnostics", nil)
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	var diag health.DiagnosticsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&diag); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if diag.WorkerCount != 3 {
+		t.Errorf("expected worker_count 3, got %d", diag.WorkerCount)
+	}
+
+	cancel()
+	a.pool.Stop()
 }

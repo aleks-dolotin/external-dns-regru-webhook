@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -13,8 +14,13 @@ import (
 
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/health"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/metrics"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/normalizer"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/queue"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/worker"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // app holds the wired application state, exposed for testing.
@@ -24,7 +30,9 @@ type app struct {
 	reloader   *auth.ReloadableDriver // nil when rotation is disabled or initial load failed
 	credsValid *int32                 // 1 = valid, 0 = invalid
 	checker    *health.Checker
-	diagSrc    *diagnosticsSource // diagnostics data source (Story 10.2)
+	diagSrc    *diagnosticsSource   // diagnostics data source (Story 10.2)
+	queue      *queue.InMemoryQueue // event queue (Story 2.1)
+	pool       *worker.WorkerPool   // worker pool (Story 2.4)
 }
 
 // diagnosticsSource bridges queue and worker to health.DiagnosticsSource.
@@ -122,12 +130,70 @@ func newApp() *app {
 	// /ready — readiness: OK only when all checks pass, JSON body.
 	a.mux.HandleFunc("/ready", a.checker.ReadyHandler)
 
+	// --- Prometheus metrics ---
+	metrics.Register(prometheus.DefaultRegisterer)
+	a.mux.Handle("/metrics", promhttp.Handler())
+
 	// --- diagnostics endpoint (Story 10.2) ---
-	// Wire queue/worker into diagSrc when Epic 2 is implemented.
-	a.diagSrc = &diagnosticsSource{}
+	a.queue = queue.New()
+	a.pool = worker.New(nil, a.queue) // adapter wired when Epic 1 adapter is instantiated
+	a.diagSrc = &diagnosticsSource{q: a.queue, p: a.pool}
 	a.mux.HandleFunc("/adapter/v1/diagnostics", health.DiagnosticsHandler(a.diagSrc))
 
+	// --- event intake endpoint (Story 2.1) ---
+	a.mux.HandleFunc("/adapter/v1/events", a.handleEvents)
+
 	return a
+}
+
+// handleEvents accepts POST requests with ExternalDNS events, normalizes
+// them into adapter.Operation payloads, and enqueues for processing.
+func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var events []normalizer.DNSEndpointEvent
+	if err := json.NewDecoder(r.Body).Decode(&events); err != nil {
+		http.Error(w, `{"error":"invalid JSON: `+err.Error()+`"}`, http.StatusBadRequest)
+		return
+	}
+
+	ops, errs := normalizer.NormalizeBatch(events)
+
+	// Enqueue valid operations.
+	for i := range ops {
+		a.queue.Enqueue(queue.Operation{
+			ID:   ops[i].OpID,
+			Body: ops[i],
+		})
+	}
+
+	resp := eventIntakeResponse{
+		Accepted: len(ops),
+		Errors:   len(errs),
+	}
+	for _, e := range errs {
+		resp.ErrorDetails = append(resp.ErrorDetails, e.Error())
+	}
+
+	code := http.StatusOK
+	if len(errs) > 0 && len(ops) == 0 {
+		code = http.StatusBadRequest
+	} else if len(errs) > 0 {
+		code = http.StatusPartialContent // 206: some accepted, some rejected
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// eventIntakeResponse is returned by POST /adapter/v1/events.
+type eventIntakeResponse struct {
+	Accepted     int      `json:"accepted"`
+	Errors       int      `json:"errors"`
+	ErrorDetails []string `json:"error_details,omitempty"`
 }
 
 // rotationInterval reads REGU_ROTATION_INTERVAL_SEC from env; defaults to 30s.
@@ -141,6 +207,22 @@ func rotationInterval() time.Duration {
 		return auth.DefaultRotationInterval
 	}
 	return time.Duration(sec) * time.Second
+}
+
+// DefaultWorkerConcurrency is used when WORKER_CONCURRENCY is not set.
+const DefaultWorkerConcurrency = 2
+
+// workerConcurrency reads WORKER_CONCURRENCY from env; defaults to DefaultWorkerConcurrency.
+func workerConcurrency() int {
+	s := os.Getenv("WORKER_CONCURRENCY")
+	if s == "" {
+		return DefaultWorkerConcurrency
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return DefaultWorkerConcurrency
+	}
+	return n
 }
 
 func main() {
@@ -158,6 +240,11 @@ func main() {
 	if a.reloader != nil {
 		go a.reloader.Run(ctx)
 	}
+
+	// Start worker pool with configurable concurrency (Story 2.4).
+	concurrency := workerConcurrency()
+	a.pool.Start(ctx, concurrency)
+	log.Printf("worker pool started with %d workers", concurrency)
 
 	go func() {
 		log.Println("sidecar starting on :8080")
