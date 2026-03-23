@@ -64,7 +64,7 @@ func (h *HTTPAdapter) FindRecord(zone, _, _ string) (*Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// naive: return nil (not found)
 	return nil, nil
 }
@@ -89,7 +89,7 @@ func (h *HTTPAdapter) CreateRecord(zone string, r *Record) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("reg.ru returned status %d", resp.StatusCode)
 	}

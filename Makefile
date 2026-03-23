@@ -3,6 +3,7 @@ MOCK_LOG := /tmp/mock-regu.log
 MOCK_PID := /tmp/mock-regu.pid
 
 .PHONY: test test-verbose test-cover test-race lint vet build \
+       setup-hooks pre-commit \
        mock-start mock-stop mock-status test-integration validate-openapi k8s-apply k8s-destroy
 
 ## ---------- Go build & quality ----------
@@ -37,6 +38,18 @@ lint:
 	@echo "Running golangci-lint..."
 	@which golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not found — install: https://golangci-lint.run/usage/install/"; exit 1; }
 	golangci-lint run ./...
+
+## ---------- Git hooks ----------
+
+setup-hooks:
+	@echo "Installing pre-commit hook..."
+	@cp scripts/pre-commit.sh .git/hooks/pre-commit
+	@chmod +x .git/hooks/pre-commit
+	@echo "Pre-commit hook installed ✅"
+
+pre-commit:
+	@echo "Running pre-commit checks manually..."
+	@bash scripts/pre-commit.sh
 
 ## ---------- Mock server & integration ----------
 
