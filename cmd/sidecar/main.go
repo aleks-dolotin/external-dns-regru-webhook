@@ -12,16 +12,21 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/adapter"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/audit"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/circuitbreaker"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/config"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/desiredstate"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/health"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/logging"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/metrics"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/normalizer"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/queue"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/quota"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/ratelimit"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/reconciler"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/safemode"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/worker"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,6 +35,11 @@ import (
 )
 
 // app holds the wired application state, exposed for testing.
+
+// Version is the adapter version string, injected at build time via
+// -ldflags "-X main.Version=x.y.z". Defaults to "dev" for local builds.
+var Version = "dev"
+
 type app struct {
 	mux         *http.ServeMux
 	logger      *zap.Logger // Story 6.2: structured logger
@@ -44,15 +54,21 @@ type app struct {
 	limiter     *ratelimit.ZoneLimiter  // Story 5.1: per-zone rate limiter
 	breaker     *circuitbreaker.Manager // Story 5.4: per-zone circuit breaker
 	auditor     audit.Auditor           // Story 6.3: audit trail
+	reconciler  *reconciler.Reconciler  // Story 8.1: reconciler for force-resync
+	resync      resyncState             // Story 8.1: force-resync state
+	safeMode    *safemode.SafeMode      // Story 8.3: safe-mode toggle
+	quotaMgr    *quota.Manager          // Story 9.2: per-namespace quota manager
+	desired     *desiredstate.Cache     // Story 8.1: desired DNS state cache for force-resync
 }
 
 // diagnosticsSource bridges queue and worker to health.DiagnosticsSource.
 // Nil-safe: returns zero values when components are not yet wired.
 type diagnosticsSource struct {
-	q   *queue.InMemoryQueue
-	p   *worker.WorkerPool
-	lim *ratelimit.ZoneLimiter  // Story 5.1/5.5
-	cb  *circuitbreaker.Manager // Story 5.4
+	q      *queue.InMemoryQueue
+	p      *worker.WorkerPool
+	lim    *ratelimit.ZoneLimiter  // Story 5.1/5.5
+	cb     *circuitbreaker.Manager // Story 5.4
+	resync *resyncState            // Story 8.1: force-resync status
 }
 
 func (d *diagnosticsSource) QueueDepth() int {
@@ -126,6 +142,38 @@ func (d *diagnosticsSource) CircuitStates() map[string]string {
 	return result
 }
 
+// ResyncRunning returns true when a force-resync is in progress (Story 8.1).
+func (d *diagnosticsSource) ResyncRunning() bool {
+	if d.resync == nil {
+		return false
+	}
+	return d.resync.running
+}
+
+// LastResyncTime returns the time of the last completed resync (Story 8.1).
+func (d *diagnosticsSource) LastResyncTime() time.Time {
+	if d.resync == nil {
+		return time.Time{}
+	}
+	return d.resync.lastResyncTime
+}
+
+// LastResyncActions returns the number of corrective actions from the last resync (Story 8.1).
+func (d *diagnosticsSource) LastResyncActions() int {
+	if d.resync == nil {
+		return 0
+	}
+	return d.resync.lastResyncOps
+}
+
+// LastResyncError returns the error message from the last resync, if any (Story 8.1).
+func (d *diagnosticsSource) LastResyncError() string {
+	if d.resync == nil {
+		return ""
+	}
+	return d.resync.lastResyncError
+}
+
 // newApp loads credentials via NewDriverFromEnv, optionally wraps in
 // ReloadableDriver for hot rotation, builds the HTTP mux, and wires
 // /ready to credential validity.
@@ -193,6 +241,7 @@ func newApp() *app {
 
 	// --- diagnostics endpoint (Story 10.2) ---
 	a.queue = queue.New()
+	a.desired = desiredstate.New()    // Story 8.1: desired DNS state cache
 	a.pool = worker.New(nil, a.queue) // adapter wired when Epic 1 adapter is instantiated
 	a.pool.SetLogger(logger)          // Story 6.2: inject structured logger
 
@@ -207,8 +256,10 @@ func newApp() *app {
 	a.limiter = ratelimit.NewZoneLimiter(ratelimit.Config{
 		RatePerHour: rateLimitPerHour(),
 	})
+	// Story 9.3: RateLimitedTotal now has namespace label; the per-zone limiter
+	// callback lacks namespace context, so metric is recorded in worker.go instead.
 	a.limiter.SetOnLimited(func(zone string) {
-		metrics.RateLimitedTotal.WithLabelValues(zone).Inc()
+		// Intentionally empty — metric recorded in worker.handleWithRetry with full labels.
 	})
 	a.pool.SetLimiter(a.limiter)
 
@@ -224,11 +275,48 @@ func newApp() *app {
 	}
 	a.pool.SetCircuitBreakers(a.breaker)
 
-	a.diagSrc = &diagnosticsSource{q: a.queue, p: a.pool, lim: a.limiter, cb: a.breaker}
+	// --- Story 8.3: safe-mode toggle ---
+	a.safeMode = safemode.New()
+	if os.Getenv("REGADAPTER_SAFE_MODE") == "true" {
+		a.safeMode.Enable()
+		logger.Info("safe-mode enabled from environment variable")
+	}
+	a.pool.SetSafeMode(a.safeMode)
+
+	// --- Story 8.1: wire reconciler when adapter is available ---
+	if a.driver != nil {
+		httpAdapter := adapter.NewHTTPAdapter(a.driver)
+		a.pool = worker.New(httpAdapter, a.queue) // re-create pool with actual adapter
+		a.pool.SetLogger(logger)
+		a.pool.SetAuditor(a.auditor)
+		a.pool.SetLimiter(a.limiter)
+		a.pool.SetCircuitBreakers(a.breaker)
+		a.pool.SetSafeMode(a.safeMode)
+
+		reconcileInterval := reconcileIntervalFromEnv()
+		a.reconciler = reconciler.New(httpAdapter, a.queue, reconcileInterval)
+		logger.Info("reconciler initialized", zap.Duration("interval", reconcileInterval))
+	} else {
+		logger.Warn("reconciler not available: adapter not initialized (credentials missing)")
+	}
+
+	a.diagSrc = &diagnosticsSource{q: a.queue, p: a.pool, lim: a.limiter, cb: a.breaker, resync: &a.resync}
 	a.mux.HandleFunc("/adapter/v1/diagnostics", health.DiagnosticsHandler(a.diagSrc))
 
 	// --- event intake endpoint (Story 2.1) ---
 	a.mux.HandleFunc("/adapter/v1/events", a.handleEvents)
+
+	// --- force-resync endpoint (Story 8.1) ---
+	a.mux.HandleFunc("/adapter/v1/resync", a.handleResync)
+
+	// --- replay failed operations (Story 8.2) ---
+	a.mux.HandleFunc("GET /adapter/v1/failed", a.handleListFailed)
+	a.mux.HandleFunc("POST /adapter/v1/replay/{id}", a.handleReplay)
+	a.mux.HandleFunc("POST /adapter/v1/replay-all", a.handleReplayAll)
+
+	// --- safe-mode toggle (Story 8.3) ---
+	a.mux.HandleFunc("POST /adapter/v1/safe-mode", a.handleSafeModeToggle)
+	a.mux.HandleFunc("GET /adapter/v1/safe-mode", a.handleSafeModeStatus)
 
 	// --- config store: zone-namespace mappings (Story 3.1) ---
 	cfgPath := os.Getenv("REGADAPTER_MAPPINGS_PATH")
@@ -241,6 +329,13 @@ func newApp() *app {
 	} else {
 		a.configStore = cfgStore
 		logger.Info("config store loaded", zap.Int("zone_count", len(cfgStore.Get().Zones)), zap.String("path", cfgPath))
+
+		// Story 9.2: initialize per-namespace quota manager from config.
+		a.quotaMgr = buildQuotaManager(cfgStore.Get())
+		cfgStore.OnReload = func(cfg *config.MappingsConfig) {
+			a.quotaMgr.UpdateQuotas(extractQuotas(cfg))
+			logger.Info("quota manager updated after config reload")
+		}
 	}
 
 	return a
@@ -275,13 +370,15 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 			namespace := ops[i].ResourceRef.Namespace
 
 			if !a.configStore.IsNamespaceAllowed(zone, namespace) {
+				// Story 9.1: increment namespace rejection metric.
+				metrics.NamespaceRejectedTotal.WithLabelValues(zone, namespace).Inc()
 				errs = append(errs, fmt.Errorf("op %s: namespace %q not allowed for zone %q",
 					ops[i].OpID, namespace, zone))
 				continue
 			}
 
-			// Story 3.3: apply FQDN template from zone mapping.
-			zm := a.configStore.FindZone(zone)
+			// Story 9.1: use namespace-specific zone mapping for per-namespace templates.
+			zm := a.configStore.FindZoneForNamespace(zone, namespace)
 			if zm != nil {
 				labels := extractLabels(ops[i].K8sMeta)
 				fqdn, err := config.RenderFQDNForZone(zm, ops[i].ResourceRef.Name, namespace, labels)
@@ -305,10 +402,32 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Story 9.2: per-namespace quota enforcement (after namespace check, before enqueue).
+		if a.quotaMgr != nil {
+			namespace := ops[i].ResourceRef.Namespace
+			if !a.quotaMgr.AllowRequest(namespace) {
+				used, limit := a.quotaMgr.CurrentUsage(namespace)
+				metrics.NamespaceQuotaRejectedTotal.WithLabelValues(namespace).Inc()
+				metrics.NamespaceQuotaUsed.WithLabelValues(namespace).Set(float64(used))
+				errs = append(errs, fmt.Errorf("op %s: %s",
+					ops[i].OpID, quota.RejectionMessage(namespace, limit)))
+				continue
+			}
+		}
+
 		a.queue.Enqueue(queue.Operation{
 			ID:   ops[i].OpID,
 			Body: ops[i],
 		})
+		// Story 8.1: update desired state cache for force-resync.
+		if a.desired != nil {
+			switch ops[i].Action {
+			case "create", "update":
+				a.desired.Put(ops[i].Zone, ops[i].Name, ops[i].Type, ops[i].Content, ops[i].TTL)
+			case "delete":
+				a.desired.Remove(ops[i].Zone, ops[i].Name, ops[i].Type)
+			}
+		}
 		// Story 6.4: log enqueue with correlating_id for end-to-end tracing.
 		a.logger.Info("event enqueued",
 			zap.String("correlating_id", ops[i].OpID),
@@ -412,12 +531,69 @@ func rateLimitPerHour() float64 {
 	return v
 }
 
+// DefaultReconcileInterval is the default periodic reconciliation interval.
+const DefaultReconcileInterval = 5 * time.Minute
+
+// reconcileIntervalFromEnv reads REGADAPTER_RECONCILE_INTERVAL_SEC from env (Story 8.1).
+// Returns DefaultReconcileInterval if not set or invalid.
+func reconcileIntervalFromEnv() time.Duration {
+	s := os.Getenv("REGADAPTER_RECONCILE_INTERVAL_SEC")
+	if s == "" {
+		return DefaultReconcileInterval
+	}
+	sec, err := strconv.Atoi(s)
+	if err != nil || sec <= 0 {
+		return DefaultReconcileInterval
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// versionMiddleware adds X-Adapter-Version header to all HTTP responses (Story 7.4).
+func versionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Adapter-Version", Version)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// extractQuotas builds a quota list from the current config.
+// Story 9.2: maps ZoneMapping.QuotaPerHour to per-namespace quotas.
+// If multiple zone entries share a namespace, the first non-zero quota wins.
+func extractQuotas(cfg *config.MappingsConfig) []quota.NamespaceQuota {
+	if cfg == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var quotas []quota.NamespaceQuota
+	for _, zm := range cfg.Zones {
+		if zm.QuotaPerHour <= 0 {
+			continue
+		}
+		for _, ns := range zm.Namespaces {
+			if _, ok := seen[ns]; ok {
+				continue
+			}
+			seen[ns] = struct{}{}
+			quotas = append(quotas, quota.NamespaceQuota{
+				Namespace:    ns,
+				LimitPerHour: zm.QuotaPerHour,
+			})
+		}
+	}
+	return quotas
+}
+
+// buildQuotaManager creates a quota.Manager from the current config.
+func buildQuotaManager(cfg *config.MappingsConfig) *quota.Manager {
+	return quota.New(extractQuotas(cfg))
+}
+
 func main() {
 	a := newApp()
 
 	srv := &http.Server{
 		Addr:    ":8080",
-		Handler: a.mux,
+		Handler: versionMiddleware(a.mux),
 	}
 
 	// Start credential rotation loop if reloader is available.

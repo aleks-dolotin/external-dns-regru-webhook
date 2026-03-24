@@ -3,19 +3,141 @@ info:
   title: ExternalDNS RegRu Adapter API
   version: '1.0.0'
   description: >-
-    Minimal internal API for the ExternalDNS to Reg.ru adapter. This
-    document describes endpoints used by sidecar and orchestration
-    components for record operations, diagnostics and admin controls.
+    Internal API for the ExternalDNS to Reg.ru adapter sidecar. Documents
+    all endpoints exposed by cmd/sidecar/main.go including health, readiness,
+    metrics, event intake, diagnostics, and admin controls.
 servers:
+  - url: http://localhost:8080
+    description: Local sidecar (default port)
   - url: https://adapter.internal.example.com
     description: Internal adapter base URL (example)
+
 paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      description: >-
+        Returns OK if the sidecar process is running. Used by Kubernetes
+        liveness probes. Always returns 200.
+      operationId: healthz
+      responses:
+        '200':
+          description: Process is alive
+          headers:
+            X-Adapter-Version:
+              $ref: '#/components/headers/X-Adapter-Version'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /ready:
+    get:
+      tags: [health]
+      summary: Readiness probe
+      description: >-
+        Returns OK when all sub-checks pass (credentials loaded, etc.).
+        Used by Kubernetes readiness probes. Returns 503 when not ready.
+      operationId: ready
+      responses:
+        '200':
+          description: All readiness checks pass
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+        '503':
+          description: One or more readiness checks failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+
+  /metrics:
+    get:
+      tags: [observability]
+      summary: Prometheus metrics
+      description: >-
+        Exposes Prometheus metrics in OpenMetrics text format. Scraped by
+        Prometheus via ServiceMonitor. Includes adapter operation counters,
+        rate limiter, circuit breaker state, and queue depth gauges.
+      operationId: metrics
+      responses:
+        '200':
+          description: Prometheus metrics in text format
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: |
+                  # HELP regadapter_operations_total Total adapter operations
+                  # TYPE regadapter_operations_total counter
+                  regadapter_operations_total{zone="example.com",action="create"} 42
+
+  /adapter/v1/events:
+    post:
+      tags: [events]
+      summary: Event intake
+      description: >-
+        Accepts ExternalDNS endpoint events, normalizes them into adapter
+        operations, filters by zone-namespace mapping, applies FQDN templates,
+        and enqueues for async processing by the worker pool.
+      operationId: ingestEvents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/DNSEndpointEvent'
+      responses:
+        '200':
+          description: All events accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventIntakeResponse'
+        '206':
+          description: Partial success — some events accepted, some rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventIntakeResponse'
+        '400':
+          description: All events rejected (invalid JSON or all failed validation)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventIntakeResponse'
+        '405':
+          description: Method not allowed (only POST)
+
+  /adapter/v1/diagnostics:
+    get:
+      tags: [diagnostics]
+      summary: Adapter diagnostics
+      description: >-
+        Returns diagnostics snapshot including queue depth, worker count,
+        last heartbeat, backpressure status, throttled zones, per-zone
+        circuit breaker states and recent errors.
+      operationId: diagnostics
+      responses:
+        '200':
+          description: Diagnostics snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiagnosticsResponse'
+
   /adapter/v1/records/query:
     post:
       tags: [records]
-      summary: "Query resource records"
+      summary: Query resource records
       description: >-
-        Return information about resource records for one or more domains.
+        Return resource records for one or more domains. Maps to Reg.ru
+        zone/get_resource_records.
       operationId: queryRecords
       requestBody:
         required: true
@@ -46,10 +168,10 @@ paths:
   /adapter/v1/records/update:
     post:
       tags: [records]
-      summary: "Create or update records (batch)"
+      summary: Create or update records (batch)
       description: >-
         Perform batched record operations (add/update/remove) using an
-        action_list. Intended to map to Reg.ru `zone/update_records`.
+        action_list. Maps to Reg.ru zone/update_records.
       operationId: updateRecords
       requestBody:
         required: true
@@ -80,10 +202,10 @@ paths:
   /adapter/v1/records/remove:
     post:
       tags: [records]
-      summary: "Remove a record"
+      summary: Remove a record
       description: >-
         Remove a specific DNS record. Idempotent: removing a non-existing
-        record is considered a successful no-op.
+        record is a successful no-op.
       operationId: removeRecord
       requestBody:
         required: true
@@ -105,26 +227,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
-  /adapter/v1/diagnostics:
-    get:
-      tags: [diagnostics]
-      summary: "Adapter diagnostics and health"
-      description: >-
-        Return diagnostics including queue depth, worker status, last
-        heartbeat to Reg.ru and recent error counts.
-      operationId: diagnostics
-      responses:
-        '200':
-          description: Diagnostics snapshot
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DiagnosticsResponse'
-
   /adapter/v1/admin/safe-mode:
     post:
       tags: [admin]
-      summary: "Admin control: set safe-mode (no-write)"
+      summary: Toggle safe-mode (no-write)
       description: >-
         Toggle safe-mode on the adapter. When enabled, write operations are
         disabled and queued for replay.
@@ -164,18 +270,179 @@ components:
       scheme: bearer
       bearerFormat: JWT
 
+  headers:
+    X-Adapter-Version:
+      description: >-
+        Adapter version string, injected at build time. Present on all
+        responses. Example: 0.1.0, dev, v1.2.3-dirty.
+      schema:
+        type: string
+        example: '0.1.0'
+
   schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, fail]
+          example: ok
+        timestamp:
+          type: string
+          format: date-time
+      required: [status, timestamp]
+
+    ReadyResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, fail]
+          example: ok
+        timestamp:
+          type: string
+          format: date-time
+        checks:
+          type: array
+          items:
+            $ref: '#/components/schemas/CheckResult'
+      required: [status, timestamp, checks]
+
+    CheckResult:
+      type: object
+      properties:
+        name:
+          type: string
+          example: credentials
+        status:
+          type: string
+          enum: [ok, fail]
+        message:
+          type: string
+      required: [name, status]
+
+    DNSEndpointEvent:
+      type: object
+      description: >-
+        ExternalDNS endpoint event. Contains DNS record change information
+        from Kubernetes resources.
+      properties:
+        kind:
+          type: string
+          example: DNSEndpoint
+        namespace:
+          type: string
+          example: default
+        name:
+          type: string
+          example: my-service
+        dnsName:
+          type: string
+          example: app.example.com
+        recordType:
+          type: string
+          enum: [A, AAAA, CNAME, TXT]
+          example: A
+        targets:
+          type: array
+          items:
+            type: string
+          example: ["10.0.0.1"]
+        recordTTL:
+          type: integer
+          example: 300
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+
+    EventIntakeResponse:
+      type: object
+      properties:
+        accepted:
+          type: integer
+          description: Number of events successfully enqueued
+          example: 3
+        errors:
+          type: integer
+          description: Number of events that failed validation
+          example: 1
+        error_details:
+          type: array
+          items:
+            type: string
+          description: Human-readable error messages for rejected events
+      required: [accepted, errors]
+
+    DiagnosticsResponse:
+      type: object
+      properties:
+        queue_depth:
+          type: integer
+          example: 5
+        worker_count:
+          type: integer
+          example: 2
+        last_heartbeat:
+          type: string
+          format: date-time
+          nullable: true
+        backpressure:
+          type: boolean
+          example: false
+        throttled_zones:
+          type: array
+          items:
+            type: string
+        zones:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ZoneStatus'
+        timestamp:
+          type: string
+          format: date-time
+      required: [queue_depth, worker_count, backpressure, timestamp]
+
+    ZoneStatus:
+      type: object
+      properties:
+        last_error:
+          type: string
+        last_error_time:
+          type: string
+          format: date-time
+          nullable: true
+        circuit_state:
+          type: string
+          enum: [closed, open, half-open]
+        rate_limited:
+          type: boolean
+
     DomainEntry:
       type: object
       properties:
         dname:
           type: string
-          description: Fully-qualified domain name (zone) or domain identifier
+          description: Fully-qualified domain name (zone)
         rrs:
           type: array
           items:
-            type: object
-            description: Resource record set entry (type, ttl, content, etc.)
+            $ref: '#/components/schemas/ResourceRecord'
+
+    ResourceRecord:
+      type: object
+      properties:
+        subname:
+          type: string
+        rectype:
+          type: string
+          enum: [A, AAAA, CNAME, TXT]
+        content:
+          type: string
+        prio:
+          type: string
+        state:
+          type: string
 
     GetResourceRecordsRequest:
       type: object
@@ -184,8 +451,7 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DomainEntry'
-      required:
-        - domains
+      required: [domains]
 
     GetResourceRecordsResponse:
       type: object
@@ -205,25 +471,34 @@ components:
                     type: string
                   result:
                     type: string
+                  service_id:
+                    type: integer
                   rrs:
                     type: array
                     items:
-                      type: object
+                      $ref: '#/components/schemas/ResourceRecord'
 
     RecordAction:
       type: object
       properties:
         action:
           type: string
-          description: add_alias | add_record | update_record | remove_record
+          description: add_alias | add_aaaa | add_cname | add_txt | remove_record
         subdomain:
           type: string
         ipaddr:
           type: string
-        ttl:
-          type: integer
-        type:
+        canonical_name:
           type: string
+        text:
+          type: string
+        record_type:
+          type: string
+          description: Used with remove_record action
+        content:
+          type: string
+          description: Used with remove_record for targeted deletion
+      required: [action, subdomain]
 
     UpdateRecordsRequest:
       type: object
@@ -239,8 +514,7 @@ components:
                 type: array
                 items:
                   $ref: '#/components/schemas/RecordAction'
-      required:
-        - domains
+      required: [domains]
 
     UpdateRecordsResponse:
       type: object
@@ -264,16 +538,24 @@ components:
                     type: array
                     items:
                       type: object
+                      properties:
+                        action:
+                          type: string
+                        result:
+                          type: string
 
     RemoveRecordRequest:
       type: object
       properties:
         dname:
           type: string
-        rr_id:
+        subdomain:
           type: string
-      required:
-        - dname
+        record_type:
+          type: string
+        content:
+          type: string
+      required: [dname]
 
     GenericSuccess:
       type: object
@@ -288,37 +570,24 @@ components:
         result:
           type: string
           example: error
-        error:
+        error_code:
           type: string
-        message:
+        error_text:
           type: string
-
-    DiagnosticsResponse:
-      type: object
-      properties:
-        uptime_seconds:
-          type: number
-        queue_depth:
-          type: integer
-        worker_count:
-          type: integer
-        last_regu_heartbeat:
-          type: string
-          format: date-time
-        recent_errors:
-          type: object
-          additionalProperties:
-            type: integer
 
 security:
   - ApiKeyAuth: []
 
 tags:
+  - name: health
+    description: Liveness and readiness probes
+  - name: observability
+    description: Prometheus metrics
+  - name: events
+    description: ExternalDNS event intake
+  - name: diagnostics
+    description: Diagnostics and operational health
   - name: records
     description: Record lifecycle operations (query/update/remove)
-  - name: diagnostics
-    description: Diagnostics and health
   - name: admin
     description: Admin operations (safe-mode)
-
-

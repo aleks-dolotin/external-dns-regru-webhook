@@ -21,11 +21,12 @@ const DefaultReloadInterval = 30 * time.Second
 
 // ZoneMapping represents a single zone configuration entry.
 type ZoneMapping struct {
-	Zone       string   `yaml:"zone"`
-	Namespaces []string `yaml:"namespaces"`
-	Template   string   `yaml:"template"`
-	TTL        int      `yaml:"ttl,omitempty"`
-	Priority   int      `yaml:"priority,omitempty"`
+	Zone         string   `yaml:"zone"`
+	Namespaces   []string `yaml:"namespaces"`
+	Template     string   `yaml:"template"`
+	TTL          int      `yaml:"ttl,omitempty"`
+	Priority     int      `yaml:"priority,omitempty"`
+	QuotaPerHour int      `yaml:"quota_per_hour,omitempty"` // Story 9.2: per-namespace quota (0 = no quota)
 }
 
 // MappingsConfig is the top-level structure for mappings.yaml.
@@ -90,21 +91,85 @@ func (s *Store) FindZone(zone string) *ZoneMapping {
 // IsNamespaceAllowed checks whether a namespace is allowed for a given zone.
 // Returns true if the zone has no namespace restrictions (empty list) or if
 // the namespace is in the allowed list.
+// Story 9.1: checks across all entries for the same zone (multi-entry support).
 func (s *Store) IsNamespaceAllowed(zone, namespace string) bool {
-	zm := s.FindZone(zone)
-	if zm == nil {
+	cfg := s.Get()
+	if cfg == nil {
 		return false
 	}
-	// Empty namespaces list means all namespaces are allowed.
-	if len(zm.Namespaces) == 0 {
-		return true
-	}
-	for _, ns := range zm.Namespaces {
-		if ns == namespace {
+	for _, zm := range cfg.Zones {
+		if zm.Zone != zone {
+			continue
+		}
+		// Empty namespaces list means all namespaces are allowed.
+		if len(zm.Namespaces) == 0 {
 			return true
+		}
+		for _, ns := range zm.Namespaces {
+			if ns == namespace {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// FindZoneForNamespace returns the specific ZoneMapping for a (zone, namespace) pair.
+// If a zone entry has an empty namespaces list (wildcard), it matches any namespace.
+// Returns nil if no matching entry is found.
+// Story 9.1: enables per-namespace template differentiation for the same zone.
+func (s *Store) FindZoneForNamespace(zone, namespace string) *ZoneMapping {
+	cfg := s.Get()
+	if cfg == nil {
+		return nil
+	}
+	for i := range cfg.Zones {
+		if cfg.Zones[i].Zone != zone {
+			continue
+		}
+		// Empty namespaces list = wildcard: matches any namespace.
+		if len(cfg.Zones[i].Namespaces) == 0 {
+			return &cfg.Zones[i]
+		}
+		for _, ns := range cfg.Zones[i].Namespaces {
+			if ns == namespace {
+				return &cfg.Zones[i]
+			}
+		}
+	}
+	return nil
+}
+
+// ZonesForNamespace returns all zone names where the given namespace is allowed.
+// A zone with an empty Namespaces list (wildcard) matches every namespace.
+// Story 8.1: used by force-resync to resolve namespace → zones.
+// Story 9.1: deduplicates results when same zone has multiple entries.
+func (s *Store) ZonesForNamespace(namespace string) []string {
+	cfg := s.Get()
+	if cfg == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var zones []string
+	for _, zm := range cfg.Zones {
+		if _, dup := seen[zm.Zone]; dup {
+			continue
+		}
+		if len(zm.Namespaces) == 0 {
+			// Wildcard — all namespaces allowed.
+			seen[zm.Zone] = struct{}{}
+			zones = append(zones, zm.Zone)
+			continue
+		}
+		for _, ns := range zm.Namespaces {
+			if ns == namespace {
+				seen[zm.Zone] = struct{}{}
+				zones = append(zones, zm.Zone)
+				break
+			}
+		}
+	}
+	return zones
 }
 
 // Reload attempts to reload the configuration from the file.

@@ -1,16 +1,15 @@
 REPO_ROOT := $(shell pwd)
-MOCK_LOG := /tmp/mock-regu.log
-MOCK_PID := /tmp/mock-regu.pid
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 .PHONY: test test-cover test-race lint vet build \
        setup-hooks pre-commit \
-       mock-start mock-stop mock-status test-integration validate-openapi k8s-apply k8s-destroy
+       mock-start mock-stop mock-status test-integration test-integration-python validate-openapi k8s-apply k8s-destroy
 
 ## ---------- Go build & quality ----------
 
 build:
-	@echo "Building sidecar..."
-	go build -o bin/sidecar ./cmd/sidecar
+	@echo "Building sidecar (version=$(VERSION))..."
+	go build -ldflags "-X main.Version=$(VERSION)" -o bin/sidecar ./cmd/sidecar
 
 test:
 	@echo "Running Go unit tests..."
@@ -55,23 +54,24 @@ pre-commit:
 
 mock-start:
 	@echo "Starting mock Reg.ru server..."
-	@pkill -f 'tests/integration/mock-regru/server.py' || true
-	@nohup python3 tests/integration/mock-regru/server.py > $(MOCK_LOG) 2>&1 & echo $$! > $(MOCK_PID)
-	@sleep 1
-	@echo "PID: $(shell cat $(MOCK_PID) 2>/dev/null || echo 'no pid')"
-	@tail -n 20 $(MOCK_LOG) || true
+	@bash devtools/mock-regru/start_mock.sh
 
 mock-stop:
 	@echo "Stopping mock Reg.ru server..."
-	-@kill $$(cat $(MOCK_PID) 2>/dev/null) || true
-	@rm -f $(MOCK_PID) || true
+	@bash devtools/mock-regru/stop_mock.sh
 
 mock-status:
-	@echo "Mock log: $(MOCK_LOG)"
-	@tail -n 40 $(MOCK_LOG) || true
+	@echo "Mock log: /tmp/mock-regru.log"
+	@tail -n 40 /tmp/mock-regru.log || true
 
-test-integration:
-	@echo "Running integration tests (mock)"
+test-integration: mock-start
+	@echo "Running Go integration tests..."
+	REGRU_BASE_URL=http://127.0.0.1:8081/api/regru2 go test -v -tags=integration ./tests/integration/... || ($(MAKE) mock-stop && exit 1)
+	@$(MAKE) mock-stop
+	@echo "Integration tests passed ✅"
+
+test-integration-python:
+	@echo "Running Python integration tests (mock-regru)..."
 	@python3 -m pytest -q tests/integration/mock-regru/test_mock_regu.py
 
 validate-openapi:

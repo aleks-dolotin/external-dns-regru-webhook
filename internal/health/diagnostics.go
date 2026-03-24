@@ -21,7 +21,16 @@ type DiagnosticsResponse struct {
 	Backpressure   bool                  `json:"backpressure"`              // Story 5.5
 	ThrottledZones []string              `json:"throttled_zones,omitempty"` // Story 5.5
 	Zones          map[string]ZoneStatus `json:"zones,omitempty"`
+	Resync         *ResyncStatus         `json:"resync,omitempty"` // Story 8.1
 	Timestamp      time.Time             `json:"timestamp"`
+}
+
+// ResyncStatus reports the state of the last force-resync operation (Story 8.1).
+type ResyncStatus struct {
+	Running     bool       `json:"running"`
+	LastTime    *time.Time `json:"last_time,omitempty"`
+	LastActions int        `json:"last_actions"`
+	LastError   string     `json:"last_error,omitempty"`
 }
 
 // DiagnosticsSource provides data for the diagnostics endpoint.
@@ -36,6 +45,11 @@ type DiagnosticsSource interface {
 	ThrottledZones() []string
 	// Story 5.4: circuit breaker states.
 	CircuitStates() map[string]string
+	// Story 8.1: force-resync status.
+	ResyncRunning() bool
+	LastResyncTime() time.Time
+	LastResyncActions() int
+	LastResyncError() string
 }
 
 // ZoneErrorInfo is a simplified zone error for the diagnostics source interface.
@@ -78,6 +92,20 @@ func DiagnosticsHandler(src DiagnosticsSource) http.HandlerFunc {
 				zs.CircuitState = state
 				resp.Zones[zone] = zs
 			}
+		}
+
+		// Story 8.1: include resync status if any resync has occurred.
+		lrt := src.LastResyncTime()
+		if src.ResyncRunning() || !lrt.IsZero() {
+			rs := &ResyncStatus{
+				Running:     src.ResyncRunning(),
+				LastActions: src.LastResyncActions(),
+				LastError:   src.LastResyncError(),
+			}
+			if !lrt.IsZero() {
+				rs.LastTime = &lrt
+			}
+			resp.Resync = rs
 		}
 
 		writeJSON(w, http.StatusOK, resp)

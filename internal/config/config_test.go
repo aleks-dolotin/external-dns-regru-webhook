@@ -374,12 +374,12 @@ func TestValidate_DuplicateZone(t *testing.T) {
 	ve := err.(*ValidationError)
 	found := false
 	for _, fe := range ve.Errors {
-		if strings.Contains(fe.Message, "duplicate") {
+		if strings.Contains(fe.Message, "overlapping") || strings.Contains(fe.Message, "conflict") || strings.Contains(fe.Message, "duplicate") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected duplicate zone error, got %v", ve.Errors)
+		t.Errorf("expected duplicate/conflict zone error, got %v", ve.Errors)
 	}
 }
 
@@ -448,6 +448,52 @@ func TestValidate_NegativePriority(t *testing.T) {
 	err := Validate(cfg)
 	if err == nil {
 		t.Fatal("expected error for negative priority")
+	}
+}
+
+// Story 9.2: quota validation tests.
+
+func TestValidate_NegativeQuotaPerHour(t *testing.T) {
+	cfg := &MappingsConfig{
+		Zones: []ZoneMapping{
+			{Zone: "example.com", Template: "{{.Name}}.example.com", QuotaPerHour: -10},
+		},
+	}
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected error for negative quota_per_hour")
+	}
+	ve := err.(*ValidationError)
+	found := false
+	for _, fe := range ve.Errors {
+		if strings.Contains(fe.Field, "quota_per_hour") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected quota_per_hour error, got %v", ve.Errors)
+	}
+}
+
+func TestValidate_ZeroQuotaPerHour_Allowed(t *testing.T) {
+	cfg := &MappingsConfig{
+		Zones: []ZoneMapping{
+			{Zone: "example.com", Template: "{{.Name}}.example.com", QuotaPerHour: 0},
+		},
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("zero quota should be valid (means no quota), got: %v", err)
+	}
+}
+
+func TestValidate_PositiveQuotaPerHour_Allowed(t *testing.T) {
+	cfg := &MappingsConfig{
+		Zones: []ZoneMapping{
+			{Zone: "example.com", Template: "{{.Name}}.example.com", Namespaces: []string{"team-a"}, QuotaPerHour: 100},
+		},
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("positive quota should be valid, got: %v", err)
 	}
 }
 
@@ -639,7 +685,227 @@ func TestRenderFQDNForZone_NilMapping(t *testing.T) {
 	}
 }
 
+// ===== Story 8.1: ZonesForNamespace tests =====
+
+func TestStore_ZonesForNamespace(t *testing.T) {
+	dir := t.TempDir()
+	yaml := `zones:
+  - zone: example.com
+    namespaces: ["prod","staging"]
+    template: "{{.Name}}.{{.Zone}}"
+  - zone: test.org
+    namespaces: []
+    template: "{{.Name}}.test.org"
+  - zone: internal.io
+    namespaces: ["prod"]
+    template: "{{.Name}}.internal.io"
+`
+	path := writeTestFile(t, dir, "mappings.yaml", yaml)
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	tests := []struct {
+		namespace string
+		wantZones []string
+	}{
+		{"prod", []string{"example.com", "test.org", "internal.io"}},
+		{"staging", []string{"example.com", "test.org"}},
+		{"dev", []string{"test.org"}}, // only wildcard zone
+		{"anything", []string{"test.org"}},
+	}
+
+	for _, tt := range tests {
+		t.Run("namespace="+tt.namespace, func(t *testing.T) {
+			got := store.ZonesForNamespace(tt.namespace)
+			if len(got) != len(tt.wantZones) {
+				t.Fatalf("ZonesForNamespace(%q) = %v (len %d), want %v (len %d)",
+					tt.namespace, got, len(got), tt.wantZones, len(tt.wantZones))
+			}
+			for i, z := range tt.wantZones {
+				if got[i] != z {
+					t.Errorf("zone[%d] = %q, want %q", i, got[i], z)
+				}
+			}
+		})
+	}
+}
+
 // ===== Zone validation helper tests =====
+
+// ===== Story 9.1: Cross-namespace isolation validation tests =====
+
+func TestValidate_SameZone_DisjointNamespaces_Allowed(t *testing.T) {
+	cfg := &MappingsConfig{
+		Zones: []ZoneMapping{
+			{Zone: "example.com", Namespaces: []string{"team-a"}, Template: "{{.Name}}.{{.Zone}}"},
+			{Zone: "example.com", Namespaces: []string{"team-b"}, Template: "{{.Name}}-alt.{{.Zone}}"},
+		},
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("expected valid config with disjoint namespaces, got: %v", err)
+	}
+}
+
+func TestValidate_SameZone_OverlappingNamespaces_Rejected(t *testing.T) {
+	cfg := &MappingsConfig{
+		Zones: []ZoneMapping{
+			{Zone: "example.com", Namespaces: []string{"team-a", "shared"}, Template: "{{.Name}}.{{.Zone}}"},
+			{Zone: "example.com", Namespaces: []string{"team-b", "shared"}, Template: "{{.Name}}-alt.{{.Zone}}"},
+		},
+	}
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected validation error for overlapping namespaces on same zone")
+	}
+	ve, ok := err.(*ValidationError)
+	if !ok {
+		t.Fatalf("expected *ValidationError, got %T", err)
+	}
+	found := false
+	for _, fe := range ve.Errors {
+		if strings.Contains(fe.Message, "overlapping") || strings.Contains(fe.Message, "conflict") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected overlapping namespace error, got %v", ve.Errors)
+	}
+}
+
+func TestValidate_SameZone_EmptyAndExplicit_Conflict(t *testing.T) {
+	cfg := &MappingsConfig{
+		Zones: []ZoneMapping{
+			{Zone: "example.com", Namespaces: []string{}, Template: "{{.Name}}.{{.Zone}}"},
+			{Zone: "example.com", Namespaces: []string{"team-a"}, Template: "{{.Name}}-alt.{{.Zone}}"},
+		},
+	}
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected validation error: empty namespaces (wildcard) conflicts with explicit namespaces")
+	}
+	ve, ok := err.(*ValidationError)
+	if !ok {
+		t.Fatalf("expected *ValidationError, got %T", err)
+	}
+	found := false
+	for _, fe := range ve.Errors {
+		if strings.Contains(fe.Message, "wildcard") || strings.Contains(fe.Message, "conflict") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected wildcard conflict error, got %v", ve.Errors)
+	}
+}
+
+func TestValidate_SameZone_BothEmptyNamespaces_Conflict(t *testing.T) {
+	cfg := &MappingsConfig{
+		Zones: []ZoneMapping{
+			{Zone: "example.com", Namespaces: []string{}, Template: "{{.Name}}.{{.Zone}}"},
+			{Zone: "example.com", Namespaces: []string{}, Template: "{{.Name}}-alt.{{.Zone}}"},
+		},
+	}
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected validation error: two wildcard entries for same zone")
+	}
+}
+
+func TestValidate_SameZone_ThreeEntries_DisjointNamespaces_Allowed(t *testing.T) {
+	cfg := &MappingsConfig{
+		Zones: []ZoneMapping{
+			{Zone: "example.com", Namespaces: []string{"team-a"}, Template: "{{.Name}}.{{.Zone}}"},
+			{Zone: "example.com", Namespaces: []string{"team-b"}, Template: "{{.Name}}-b.{{.Zone}}"},
+			{Zone: "example.com", Namespaces: []string{"team-c"}, Template: "{{.Name}}-c.{{.Zone}}"},
+		},
+	}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("expected valid config with three disjoint entries, got: %v", err)
+	}
+}
+
+// ===== Story 9.1: FindZoneForNamespace tests =====
+
+func TestStore_FindZoneForNamespace(t *testing.T) {
+	dir := t.TempDir()
+	yaml := `zones:
+  - zone: example.com
+    namespaces: ["team-a"]
+    template: "{{.Name}}-a.{{.Zone}}"
+    ttl: 300
+  - zone: example.com
+    namespaces: ["team-b"]
+    template: "{{.Name}}-b.{{.Zone}}"
+    ttl: 600
+  - zone: test.org
+    namespaces: []
+    template: "{{.Name}}.test.org"
+`
+	path := writeTestFile(t, dir, "mappings.yaml", yaml)
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// team-a should get the first mapping
+	zm := store.FindZoneForNamespace("example.com", "team-a")
+	if zm == nil {
+		t.Fatal("expected to find mapping for team-a")
+	}
+	if zm.TTL != 300 {
+		t.Errorf("expected TTL 300 for team-a, got %d", zm.TTL)
+	}
+
+	// team-b should get the second mapping
+	zm = store.FindZoneForNamespace("example.com", "team-b")
+	if zm == nil {
+		t.Fatal("expected to find mapping for team-b")
+	}
+	if zm.TTL != 600 {
+		t.Errorf("expected TTL 600 for team-b, got %d", zm.TTL)
+	}
+
+	// team-c should NOT find a mapping for example.com
+	zm = store.FindZoneForNamespace("example.com", "team-c")
+	if zm != nil {
+		t.Error("expected nil for unauthorized namespace team-c on example.com")
+	}
+
+	// test.org with empty namespaces (wildcard) should match any namespace
+	zm = store.FindZoneForNamespace("test.org", "anything")
+	if zm == nil {
+		t.Fatal("expected to find mapping for wildcard zone test.org")
+	}
+
+	// nonexistent zone
+	zm = store.FindZoneForNamespace("nonexistent.com", "team-a")
+	if zm != nil {
+		t.Error("expected nil for nonexistent zone")
+	}
+}
+
+// ===== Story 9.1: Namespace rejection (IsNamespaceAllowed already tested, verify cross-namespace) =====
+
+func TestStore_IsNamespaceAllowed_CrossNamespace_Rejected(t *testing.T) {
+	dir := t.TempDir()
+	yaml := `zones:
+  - zone: example.com
+    namespaces: ["team-a"]
+    template: "{{.Name}}.{{.Zone}}"
+`
+	path := writeTestFile(t, dir, "mappings.yaml", yaml)
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// team-b should be rejected
+	if store.IsNamespaceAllowed("example.com", "team-b") {
+		t.Error("expected team-b to be rejected for zone example.com")
+	}
+}
 
 func TestIsValidZone(t *testing.T) {
 	tests := []struct {

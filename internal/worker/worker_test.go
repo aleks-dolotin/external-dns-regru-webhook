@@ -300,12 +300,12 @@ func TestWorkerPool_V2Metrics_Success(t *testing.T) {
 	p.SetRetryPolicy(fastRetry)
 
 	// Record baseline counter values before test.
-	beforeCounter := getCounterValue(t, metrics.RequestsTotalV2, "v2test.com", "A", "create", "success")
+	beforeCounter := getCounterValue(t, metrics.RequestsTotalV2, "v2test.com", "A", "create", "success", "test-ns")
 	beforeHist := getHistogramCount(t, metrics.RequestDurationV2, "v2test.com", "A", "create")
 
 	q.Enqueue(queue.Operation{
 		ID:   "op-v2-ok",
-		Body: adapter.Operation{OpID: "op-v2-ok", Action: "create", Zone: "v2test.com", Name: "a.v2test.com", Type: "A", Content: "1.2.3.4"},
+		Body: adapter.Operation{OpID: "op-v2-ok", Action: "create", Zone: "v2test.com", Name: "a.v2test.com", Type: "A", Content: "1.2.3.4", ResourceRef: adapter.ResourceRef{Namespace: "test-ns"}},
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -314,9 +314,9 @@ func TestWorkerPool_V2Metrics_Success(t *testing.T) {
 	cancel()
 	p.wg.Wait()
 
-	afterCounter := getCounterValue(t, metrics.RequestsTotalV2, "v2test.com", "A", "create", "success")
+	afterCounter := getCounterValue(t, metrics.RequestsTotalV2, "v2test.com", "A", "create", "success", "test-ns")
 	if afterCounter-beforeCounter != 1 {
-		t.Errorf("expected RequestsTotalV2{v2test.com,A,create,success} delta=1, got %.0f", afterCounter-beforeCounter)
+		t.Errorf("expected RequestsTotalV2{v2test.com,A,create,success,test-ns} delta=1, got %.0f", afterCounter-beforeCounter)
 	}
 
 	afterHist := getHistogramCount(t, metrics.RequestDurationV2, "v2test.com", "A", "create")
@@ -331,12 +331,12 @@ func TestWorkerPool_V2Metrics_Failure(t *testing.T) {
 	p := New(ma, q)
 	p.SetRetryPolicy(fastRetry)
 
-	beforeCounter := getCounterValue(t, metrics.RequestsTotalV2, "v2fail.com", "CNAME", "create", "failure")
+	beforeCounter := getCounterValue(t, metrics.RequestsTotalV2, "v2fail.com", "CNAME", "create", "failure", "fail-ns")
 	beforeHist := getHistogramCount(t, metrics.RequestDurationV2, "v2fail.com", "CNAME", "create")
 
 	q.Enqueue(queue.Operation{
 		ID:   "op-v2-fail",
-		Body: adapter.Operation{OpID: "op-v2-fail", Action: "create", Zone: "v2fail.com", Name: "c.v2fail.com", Type: "CNAME"},
+		Body: adapter.Operation{OpID: "op-v2-fail", Action: "create", Zone: "v2fail.com", Name: "c.v2fail.com", Type: "CNAME", ResourceRef: adapter.ResourceRef{Namespace: "fail-ns"}},
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -345,9 +345,9 @@ func TestWorkerPool_V2Metrics_Failure(t *testing.T) {
 	cancel()
 	p.wg.Wait()
 
-	afterCounter := getCounterValue(t, metrics.RequestsTotalV2, "v2fail.com", "CNAME", "create", "failure")
+	afterCounter := getCounterValue(t, metrics.RequestsTotalV2, "v2fail.com", "CNAME", "create", "failure", "fail-ns")
 	if afterCounter-beforeCounter != 1 {
-		t.Errorf("expected RequestsTotalV2{v2fail.com,CNAME,create,failure} delta=1, got %.0f", afterCounter-beforeCounter)
+		t.Errorf("expected RequestsTotalV2{v2fail.com,CNAME,create,failure,fail-ns} delta=1, got %.0f", afterCounter-beforeCounter)
 	}
 
 	// Duration should be recorded for each attempt (3 attempts with fastRetry).

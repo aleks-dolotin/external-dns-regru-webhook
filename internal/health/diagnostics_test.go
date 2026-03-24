@@ -10,13 +10,17 @@ import (
 
 // mockDiagSource is a test implementation of DiagnosticsSource.
 type mockDiagSource struct {
-	queueDepth     int
-	workerCount    int
-	heartbeat      time.Time
-	zoneErrors     map[string]ZoneErrorInfo
-	backpressured  bool
-	throttledZones []string
-	circuitStates  map[string]string
+	queueDepth      int
+	workerCount     int
+	heartbeat       time.Time
+	zoneErrors      map[string]ZoneErrorInfo
+	backpressured   bool
+	throttledZones  []string
+	circuitStates   map[string]string
+	resyncRunning   bool
+	lastResyncTime  time.Time
+	lastResyncOps   int
+	lastResyncError string
 }
 
 func (m *mockDiagSource) QueueDepth() int                      { return m.queueDepth }
@@ -26,6 +30,10 @@ func (m *mockDiagSource) ZoneErrors() map[string]ZoneErrorInfo { return m.zoneEr
 func (m *mockDiagSource) IsBackpressured() bool                { return m.backpressured }
 func (m *mockDiagSource) ThrottledZones() []string             { return m.throttledZones }
 func (m *mockDiagSource) CircuitStates() map[string]string     { return m.circuitStates }
+func (m *mockDiagSource) ResyncRunning() bool                  { return m.resyncRunning }
+func (m *mockDiagSource) LastResyncTime() time.Time            { return m.lastResyncTime }
+func (m *mockDiagSource) LastResyncActions() int               { return m.lastResyncOps }
+func (m *mockDiagSource) LastResyncError() string              { return m.lastResyncError }
 
 func TestDiagnosticsHandler_Empty(t *testing.T) {
 	src := &mockDiagSource{}

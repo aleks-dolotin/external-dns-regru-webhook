@@ -1082,3 +1082,69 @@ func TestE2E_CorrelatingID_TracedThroughPipeline(t *testing.T) {
 
 	t.Logf("E2E tracing: correlating_id=%s, messages=%v", firstID, foundMsgs)
 }
+
+// --- Story 7.4: X-Adapter-Version header tests ---
+
+func TestVersionMiddleware_SetsHeader(t *testing.T) {
+	// Save and restore original version.
+	origVersion := Version
+	Version = "1.2.3-test"
+	defer func() { Version = origVersion }()
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := versionMiddleware(inner)
+
+	req := httptest.NewRequest(http.MethodGet, "/anything", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	got := rec.Header().Get("X-Adapter-Version")
+	if got != "1.2.3-test" {
+		t.Errorf("expected X-Adapter-Version=1.2.3-test, got %q", got)
+	}
+}
+
+func TestVersionHeader_OnHealthz(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	handler := versionMiddleware(a.mux)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rec.Code)
+	}
+	v := rec.Header().Get("X-Adapter-Version")
+	if v == "" {
+		t.Error("expected X-Adapter-Version header on /healthz, got empty")
+	}
+}
+
+func TestVersionHeader_OnDiagnostics(t *testing.T) {
+	setCredEnv(t, "user", "pass")
+	a := newApp()
+
+	handler := versionMiddleware(a.mux)
+	req := httptest.NewRequest(http.MethodGet, "/adapter/v1/diagnostics", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rec.Code)
+	}
+	v := rec.Header().Get("X-Adapter-Version")
+	if v == "" {
+		t.Error("expected X-Adapter-Version header on /adapter/v1/diagnostics, got empty")
+	}
+}
+
+func TestVersionVariable_DefaultIsDev(t *testing.T) {
+	// Version should have a non-empty default.
+	if Version == "" {
+		t.Error("Version should not be empty — expected at least 'dev'")
+	}
+}

@@ -40,21 +40,22 @@ func getGaugeValue(gauge prometheus.Gauge) float64 {
 func TestRequestsTotalV2_IncrementsWithAllLabels(t *testing.T) {
 	// Reset the metric by creating fresh label combinations.
 	// Note: CounterVec cannot be reset, so we test increment delta.
-	before := getCounterValue(RequestsTotalV2, "example.com", "A", "create", "success")
+	// Story 9.3: namespace label added as 5th label.
+	before := getCounterValue(RequestsTotalV2, "example.com", "A", "create", "success", "prod")
 
-	RequestsTotalV2.WithLabelValues("example.com", "A", "create", "success").Inc()
-	RequestsTotalV2.WithLabelValues("example.com", "A", "create", "success").Inc()
-	RequestsTotalV2.WithLabelValues("other.com", "CNAME", "delete", "failure").Inc()
+	RequestsTotalV2.WithLabelValues("example.com", "A", "create", "success", "prod").Inc()
+	RequestsTotalV2.WithLabelValues("example.com", "A", "create", "success", "prod").Inc()
+	RequestsTotalV2.WithLabelValues("other.com", "CNAME", "delete", "failure", "staging").Inc()
 
-	after := getCounterValue(RequestsTotalV2, "example.com", "A", "create", "success")
+	after := getCounterValue(RequestsTotalV2, "example.com", "A", "create", "success", "prod")
 	delta := after - before
 	if delta != 2 {
-		t.Errorf("expected RequestsTotalV2{example.com,A,create,success} delta=2, got %.0f", delta)
+		t.Errorf("expected RequestsTotalV2{example.com,A,create,success,prod} delta=2, got %.0f", delta)
 	}
 
-	otherAfter := getCounterValue(RequestsTotalV2, "other.com", "CNAME", "delete", "failure")
+	otherAfter := getCounterValue(RequestsTotalV2, "other.com", "CNAME", "delete", "failure", "staging")
 	if otherAfter < 1 {
-		t.Errorf("expected RequestsTotalV2{other.com,CNAME,delete,failure} >= 1, got %.0f", otherAfter)
+		t.Errorf("expected RequestsTotalV2{other.com,CNAME,delete,failure,staging} >= 1, got %.0f", otherAfter)
 	}
 }
 
@@ -99,24 +100,79 @@ func TestWorkerCountGauge_ReflectsSetValue(t *testing.T) {
 	}
 }
 
+// ===== Story 9.3: Tenant metrics breakdown tests =====
+
+func TestRateLimitedTotal_HasNamespaceLabel(t *testing.T) {
+	before := getCounterValue(RateLimitedTotal, "example.com", "team-a")
+	RateLimitedTotal.WithLabelValues("example.com", "team-a").Inc()
+	after := getCounterValue(RateLimitedTotal, "example.com", "team-a")
+	if after-before != 1 {
+		t.Errorf("expected RateLimitedTotal with namespace label delta=1, got %.0f", after-before)
+	}
+}
+
+func TestFailedOpsTotal_HasNamespaceLabel(t *testing.T) {
+	before := getCounterValue(FailedOpsTotal, "create", "team-b")
+	FailedOpsTotal.WithLabelValues("create", "team-b").Inc()
+	after := getCounterValue(FailedOpsTotal, "create", "team-b")
+	if after-before != 1 {
+		t.Errorf("expected FailedOpsTotal with namespace label delta=1, got %.0f", after-before)
+	}
+}
+
+func TestRequestsTotalV2_NamespaceLabelPresent(t *testing.T) {
+	// Verify that different namespaces produce independent counters.
+	beforeA := getCounterValue(RequestsTotalV2, "z.com", "A", "create", "success", "ns-a")
+	beforeB := getCounterValue(RequestsTotalV2, "z.com", "A", "create", "success", "ns-b")
+
+	RequestsTotalV2.WithLabelValues("z.com", "A", "create", "success", "ns-a").Inc()
+	RequestsTotalV2.WithLabelValues("z.com", "A", "create", "success", "ns-a").Inc()
+	RequestsTotalV2.WithLabelValues("z.com", "A", "create", "success", "ns-b").Inc()
+
+	afterA := getCounterValue(RequestsTotalV2, "z.com", "A", "create", "success", "ns-a")
+	afterB := getCounterValue(RequestsTotalV2, "z.com", "A", "create", "success", "ns-b")
+
+	if afterA-beforeA != 2 {
+		t.Errorf("expected ns-a delta=2, got %.0f", afterA-beforeA)
+	}
+	if afterB-beforeB != 1 {
+		t.Errorf("expected ns-b delta=1, got %.0f", afterB-beforeB)
+	}
+}
+
+func TestRequestDurationV2_NoNamespaceLabel(t *testing.T) {
+	// Story 9.3 AC#3: histograms should NOT have namespace label.
+	// RequestDurationV2 should still accept exactly 3 labels: zone, record_type, operation.
+	before := getHistogramCount(RequestDurationV2, "card.com", "AAAA", "update")
+	RequestDurationV2.WithLabelValues("card.com", "AAAA", "update").Observe(0.5)
+	after := getHistogramCount(RequestDurationV2, "card.com", "AAAA", "update")
+	if after-before != 1 {
+		t.Errorf("expected histogram count delta=1, got %d", after-before)
+	}
+}
+
 func TestRegister_IncludesV2Metrics(t *testing.T) {
 	// Verify that all expected metric collectors are non-nil and have correct descriptions.
 	// We cannot rely on Register() + Gather() in unit tests because sync.Once
 	// may already have fired with a different registry. Instead, verify the
 	// exported variables are properly initialized.
 	collectors := map[string]prometheus.Collector{
-		"RequestsTotal":     RequestsTotal,
-		"RequestDuration":   RequestDuration,
-		"RetriesTotal":      RetriesTotal,
-		"FailedOpsTotal":    FailedOpsTotal,
-		"RateLimitedTotal":  RateLimitedTotal,
-		"APIRetriesTotal":   APIRetriesTotal,
-		"APIBackoffSeconds": APIBackoffSeconds,
-		"CircuitState":      CircuitState,
-		"RequestsTotalV2":   RequestsTotalV2,
-		"RequestDurationV2": RequestDurationV2,
-		"QueueDepth":        QueueDepth,
-		"WorkerCountGauge":  WorkerCountGauge,
+		"RequestsTotal":               RequestsTotal,
+		"RequestDuration":             RequestDuration,
+		"RetriesTotal":                RetriesTotal,
+		"FailedOpsTotal":              FailedOpsTotal,
+		"RateLimitedTotal":            RateLimitedTotal,
+		"APIRetriesTotal":             APIRetriesTotal,
+		"APIBackoffSeconds":           APIBackoffSeconds,
+		"CircuitState":                CircuitState,
+		"NamespaceRejectedTotal":      NamespaceRejectedTotal,
+		"NamespaceQuotaUsed":          NamespaceQuotaUsed,
+		"NamespaceQuotaLimit":         NamespaceQuotaLimit,
+		"NamespaceQuotaRejectedTotal": NamespaceQuotaRejectedTotal,
+		"RequestsTotalV2":             RequestsTotalV2,
+		"RequestDurationV2":           RequestDurationV2,
+		"QueueDepth":                  QueueDepth,
+		"WorkerCountGauge":            WorkerCountGauge,
 	}
 
 	for name, c := range collectors {

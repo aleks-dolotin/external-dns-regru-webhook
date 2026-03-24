@@ -41,6 +41,7 @@ type WorkerPool struct {
 	retryPolicy retry.Policy
 	limiter     *ratelimit.ZoneLimiter // Story 5.1: per-zone rate limiter (nil = disabled)
 	breaker     CircuitBreakers        // Story 5.4: per-zone circuit breaker (nil = disabled)
+	safeMode    SafeModeChecker        // Story 8.3: safe-mode toggle (nil = disabled)
 	logger      *zap.Logger            // Story 6.2: structured logger (nil = nop)
 	auditor     audit.Auditor          // Story 6.3: audit trail (nil = nop)
 	wg          sync.WaitGroup
@@ -63,6 +64,13 @@ type CircuitBreakers interface {
 	RecordSuccess(zone string)
 	// RecordFailure records a failed operation for the zone.
 	RecordFailure(zone string)
+}
+
+// SafeModeChecker checks whether safe-mode is active.
+// Implemented by safemode.SafeMode (Story 8.3).
+type SafeModeChecker interface {
+	IsEnabled() bool
+	IncrementSuppressed()
 }
 
 // New creates a WorkerPool with the default retry policy.
@@ -109,6 +117,11 @@ func (p *WorkerPool) SetCircuitBreakers(cb CircuitBreakers) {
 	p.breaker = cb
 }
 
+// SetSafeMode attaches a safe-mode checker (Story 8.3).
+func (p *WorkerPool) SetSafeMode(sm SafeModeChecker) {
+	p.safeMode = sm
+}
+
 // WorkerCount returns the number of currently running workers.
 func (p *WorkerPool) WorkerCount() int {
 	return int(atomic.LoadInt32(&p.workerCount))
@@ -139,6 +152,38 @@ func (p *WorkerPool) FailedOps() []FailedOp {
 	cp := make([]FailedOp, len(p.failedOps))
 	copy(cp, p.failedOps)
 	return cp
+}
+
+// ReplayOp finds a failed operation by ID, removes it from the dead-letter list,
+// and returns it for re-enqueue. Returns an error if the operation is not found.
+// Story 8.2: replay single failed operation.
+func (p *WorkerPool) ReplayOp(opID string) (adapter.Operation, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for i, fo := range p.failedOps {
+		if fo.Op.OpID == opID {
+			op := fo.Op
+			// Remove from dead-letter list.
+			p.failedOps = append(p.failedOps[:i], p.failedOps[i+1:]...)
+			return op, nil
+		}
+	}
+	return adapter.Operation{}, fmt.Errorf("operation %s not found in failed list", opID)
+}
+
+// ReplayAll removes all operations from the dead-letter list and returns them.
+// Story 8.2: replay all failed operations.
+func (p *WorkerPool) ReplayAll() []adapter.Operation {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	ops := make([]adapter.Operation, len(p.failedOps))
+	for i, fo := range p.failedOps {
+		ops[i] = fo.Op
+	}
+	p.failedOps = p.failedOps[:0] // clear without reallocating
+	return ops
 }
 
 // Start launches the given number of worker goroutines.
@@ -206,6 +251,15 @@ func (p *WorkerPool) handleWithRetry(ctx context.Context, op *queue.Operation) {
 		zap.String("record_type", adapterOp.Type),
 	)
 
+	// Story 8.3: safe-mode check — suppress writes, re-enqueue after delay.
+	if p.safeMode != nil && p.safeMode.IsEnabled() {
+		p.safeMode.IncrementSuppressed()
+		opLog.Info("safe-mode: write suppressed, re-enqueuing")
+		time.Sleep(5 * time.Second)
+		p.queue.Enqueue(*op)
+		return
+	}
+
 	// Story 6.4 (review fix): propagate structured logger into context so that
 	// downstream layers (adapter, dispatch) can extract it via logging.FromContext.
 	ctx = logging.WithContext(ctx, opLog)
@@ -225,7 +279,7 @@ func (p *WorkerPool) handleWithRetry(ctx context.Context, op *queue.Operation) {
 	if p.limiter != nil {
 		if err := p.limiter.Wait(ctx, adapterOp.Zone); err != nil {
 			opLog.Warn("rate-limited", zap.Error(err))
-			metrics.RateLimitedTotal.WithLabelValues(adapterOp.Zone).Inc()
+			metrics.RateLimitedTotal.WithLabelValues(adapterOp.Zone, adapterOp.ResourceRef.Namespace).Inc()
 			// Re-enqueue so the operation is not lost.
 			p.queue.Enqueue(*op)
 			return
@@ -284,7 +338,7 @@ func (p *WorkerPool) handleWithRetry(ctx context.Context, op *queue.Operation) {
 			p.breaker.RecordSuccess(adapterOp.Zone)
 		}
 		// Story 6.1: record V2 request counter (success).
-		metrics.RequestsTotalV2.WithLabelValues(adapterOp.Zone, adapterOp.Type, adapterOp.Action, "success").Inc()
+		metrics.RequestsTotalV2.WithLabelValues(adapterOp.Zone, adapterOp.Type, adapterOp.Action, "success", adapterOp.ResourceRef.Namespace).Inc()
 		p.mu.Lock()
 		p.lastHeartbeat = time.Now().UTC()
 		p.mu.Unlock()
@@ -306,7 +360,7 @@ func (p *WorkerPool) handleWithRetry(ctx context.Context, op *queue.Operation) {
 			p.breaker.RecordFailure(adapterOp.Zone)
 		}
 		// Story 6.1: record V2 request counter (failure).
-		metrics.RequestsTotalV2.WithLabelValues(adapterOp.Zone, adapterOp.Type, adapterOp.Action, "failure").Inc()
+		metrics.RequestsTotalV2.WithLabelValues(adapterOp.Zone, adapterOp.Type, adapterOp.Action, "failure", adapterOp.ResourceRef.Namespace).Inc()
 		// Dead-letter: max retries exhausted
 		opLog.Error("operation FAILED",
 			zap.Int("attempts", result.Attempts),
@@ -328,7 +382,7 @@ func (p *WorkerPool) handleWithRetry(ctx context.Context, op *queue.Operation) {
 			Result:        "failure",
 			ErrorDetail:   errDetail,
 		})
-		metrics.FailedOpsTotal.WithLabelValues(adapterOp.Action).Inc()
+		metrics.FailedOpsTotal.WithLabelValues(adapterOp.Action, adapterOp.ResourceRef.Namespace).Inc()
 		p.recordZoneError(adapterOp.Zone, result.Err)
 		p.mu.Lock()
 		p.failedOps = append(p.failedOps, FailedOp{
@@ -390,4 +444,11 @@ func (p *WorkerPool) recordZoneError(zone string, err error) {
 func (p *WorkerPool) Stop() {
 	close(p.stop)
 	p.wg.Wait()
+}
+
+// InjectFailedOp adds a FailedOp to the dead-letter list. Test helper only.
+func (p *WorkerPool) InjectFailedOp(fo FailedOp) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failedOps = append(p.failedOps, fo)
 }

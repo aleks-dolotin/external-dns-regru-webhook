@@ -42,7 +42,13 @@ func Validate(cfg *MappingsConfig) error {
 	}
 
 	var errs []FieldError
-	seen := make(map[string]struct{})
+	// Story 9.1: Track zone entries with their namespace sets for cross-namespace conflict detection.
+	// Key: zone name → list of (index, namespaces) for overlap checking.
+	type zoneEntry struct {
+		index      int
+		namespaces []string
+	}
+	seenZones := make(map[string][]zoneEntry)
 
 	for i, zm := range cfg.Zones {
 		prefix := fmt.Sprintf("zones[%d]", i)
@@ -60,15 +66,17 @@ func Validate(cfg *MappingsConfig) error {
 			})
 		}
 
-		// Duplicate zone detection.
+		// Story 9.1: Cross-namespace conflict detection for same zone.
 		if zm.Zone != "" {
-			if _, dup := seen[zm.Zone]; dup {
-				errs = append(errs, FieldError{
-					Field:   prefix + ".zone",
-					Message: fmt.Sprintf("duplicate zone %q", zm.Zone),
-				})
+			for _, prev := range seenZones[zm.Zone] {
+				if namespacesOverlap(prev.namespaces, zm.Namespaces) {
+					errs = append(errs, FieldError{
+						Field:   prefix + ".zone",
+						Message: fmt.Sprintf("zone %q at index %d and %d have overlapping or conflicting namespace scopes", zm.Zone, prev.index, i),
+					})
+				}
 			}
-			seen[zm.Zone] = struct{}{}
+			seenZones[zm.Zone] = append(seenZones[zm.Zone], zoneEntry{index: i, namespaces: zm.Namespaces})
 		}
 
 		// Template must be non-empty and valid Go template syntax.
@@ -97,6 +105,14 @@ func Validate(cfg *MappingsConfig) error {
 			errs = append(errs, FieldError{
 				Field:   prefix + ".priority",
 				Message: fmt.Sprintf("priority must be >= 0, got %d", zm.Priority),
+			})
+		}
+
+		// Story 9.2: QuotaPerHour must be non-negative (0 = no quota).
+		if zm.QuotaPerHour < 0 {
+			errs = append(errs, FieldError{
+				Field:   prefix + ".quota_per_hour",
+				Message: fmt.Sprintf("quota_per_hour must be >= 0, got %d", zm.QuotaPerHour),
 			})
 		}
 
@@ -148,4 +164,25 @@ func isValidZone(zone string) bool {
 func validateTemplate(tmpl string) error {
 	_, err := template.New("check").Parse(tmpl)
 	return err
+}
+
+// namespacesOverlap returns true if two namespace lists have conflicting scopes.
+// An empty list is treated as a wildcard (all namespaces), which conflicts with
+// any other list. Two non-empty lists conflict if they share at least one namespace.
+// Story 9.1: cross-namespace isolation validation.
+func namespacesOverlap(a, b []string) bool {
+	// Wildcard (empty) conflicts with everything.
+	if len(a) == 0 || len(b) == 0 {
+		return true
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, ns := range a {
+		set[ns] = struct{}{}
+	}
+	for _, ns := range b {
+		if _, ok := set[ns]; ok {
+			return true
+		}
+	}
+	return false
 }
