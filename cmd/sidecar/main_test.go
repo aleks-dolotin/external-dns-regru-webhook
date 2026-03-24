@@ -8,14 +8,19 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/adapter"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/audit"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/health"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/normalizer"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/queue"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // setCredEnv uses t.Setenv for automatic cleanup after test.
@@ -965,4 +970,115 @@ func TestExtractLabels_WrongType(t *testing.T) {
 	if got := extractLabels(meta); got != nil {
 		t.Errorf("expected nil for wrong type, got %v", got)
 	}
+}
+
+// --- E2E correlating_id tracing test (Story 6.4 review fix) ---
+
+// newTestLoggedApp creates an app with a zap logger that writes to the provided buffer,
+// allowing test assertions on structured log output.
+func newTestLoggedApp(t *testing.T, buf *bytes.Buffer) *app {
+	t.Helper()
+	setCredEnv(t, "user", "pass")
+	t.Setenv("REGADAPTER_MAPPINGS_PATH", "/nonexistent/path.yaml") // no config store
+
+	encoderCfg := zapcore.EncoderConfig{
+		TimeKey:        "timestamp",
+		LevelKey:       "level",
+		MessageKey:     "msg",
+		EncodeLevel:    zapcore.LowercaseLevelEncoder,
+		EncodeTime:     zapcore.ISO8601TimeEncoder,
+		EncodeDuration: zapcore.SecondsDurationEncoder,
+	}
+	core := zapcore.NewCore(
+		zapcore.NewJSONEncoder(encoderCfg),
+		zapcore.AddSync(buf),
+		zapcore.DebugLevel,
+	)
+	testLogger := zap.New(core)
+
+	a := newApp()
+	// Override logger with test logger that captures output.
+	a.logger = testLogger
+	a.pool.SetLogger(testLogger)
+	normalizer.SetLogger(testLogger)
+	// Override auditor to use test logger.
+	a.pool.SetAuditor(audit.Nop())
+
+	return a
+}
+
+func TestE2E_CorrelatingID_TracedThroughPipeline(t *testing.T) {
+	var logBuf bytes.Buffer
+	a := newTestLoggedApp(t, &logBuf)
+
+	// Send a valid event through the HTTP endpoint.
+	body := `[{
+		"zone":"example.com",
+		"fqdn":"app.example.com",
+		"record_type":"A",
+		"action":"create",
+		"content":"1.2.3.4",
+		"resource_ref":{"kind":"Ingress","namespace":"prod","name":"web"}
+	}]`
+	req := httptest.NewRequest(http.MethodPost, "/adapter/v1/events", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	a.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	// Parse all log lines and find unique correlating_ids.
+	logOutput := logBuf.String()
+	lines := strings.Split(strings.TrimSpace(logOutput), "\n")
+
+	var correlatingIDs []string
+	var foundMsgs []string
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		var entry map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue // skip non-JSON lines
+		}
+		cid, ok := entry["correlating_id"].(string)
+		if !ok || cid == "" {
+			continue
+		}
+		correlatingIDs = append(correlatingIDs, cid)
+		if msg, ok := entry["msg"].(string); ok {
+			foundMsgs = append(foundMsgs, msg)
+		}
+	}
+
+	if len(correlatingIDs) == 0 {
+		t.Fatalf("no log lines with correlating_id found. Full log output:\n%s", logOutput)
+	}
+
+	// All correlating_ids must be the same (single operation).
+	firstID := correlatingIDs[0]
+	for i, cid := range correlatingIDs {
+		if cid != firstID {
+			t.Errorf("correlating_id mismatch at line %d: expected %q, got %q", i, firstID, cid)
+		}
+	}
+
+	// Verify at least the normalize and enqueue stages logged with correlating_id.
+	wantMsgs := []string{"event normalized", "event enqueued"}
+	for _, want := range wantMsgs {
+		found := false
+		for _, msg := range foundMsgs {
+			if msg == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected log message %q with correlating_id, not found. Got messages: %v", want, foundMsgs)
+		}
+	}
+
+	t.Logf("E2E tracing: correlating_id=%s, messages=%v", firstID, foundMsgs)
 }

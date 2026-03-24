@@ -50,6 +50,25 @@ var (
 		[]string{"zone"},
 	)
 
+	// Story 6.1: extended metrics with zone and record_type labels.
+	// V2 metrics coexist with originals for backward compatibility during transition.
+	RequestsTotalV2 = prometheus.NewCounterVec(
+		prometheus.CounterOpts{Namespace: "regru", Name: "api_requests_total_v2", Help: "Total requests to reg.ru API with zone and record_type labels"},
+		[]string{"zone", "record_type", "operation", "outcome"},
+	)
+	RequestDurationV2 = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{Namespace: "regru", Name: "api_request_duration_seconds_v2", Help: "Duration of requests to reg.ru API with zone and record_type labels"},
+		[]string{"zone", "record_type", "operation"},
+	)
+
+	// Story 6.1: operational gauges.
+	QueueDepth = prometheus.NewGauge(
+		prometheus.GaugeOpts{Namespace: "regru", Name: "queue_depth", Help: "Current number of operations in the work queue"},
+	)
+	WorkerCountGauge = prometheus.NewGauge(
+		prometheus.GaugeOpts{Namespace: "regru", Name: "worker_count", Help: "Current number of running worker goroutines"},
+	)
+
 	registerOnce sync.Once
 )
 
@@ -65,5 +84,9 @@ func Register(r prometheus.Registerer) {
 		r.MustRegister(APIRetriesTotal)
 		r.MustRegister(APIBackoffSeconds)
 		r.MustRegister(CircuitState)
+		r.MustRegister(RequestsTotalV2)
+		r.MustRegister(RequestDurationV2)
+		r.MustRegister(QueueDepth)
+		r.MustRegister(WorkerCountGauge)
 	})
 }

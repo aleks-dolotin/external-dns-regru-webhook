@@ -1,10 +1,7 @@
 package adapter
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -20,27 +17,20 @@ func (k CacheKey) String() string {
 	return fmt.Sprintf("%s/%s/%s", k.Zone, k.Name, k.RecType)
 }
 
-// ExternalIDCache provides a thread-safe, optionally persistent cache
-// for mapping DNS record identifiers to Reg.ru external IDs (service_id).
+// ExternalIDCache provides a thread-safe in-memory cache for mapping
+// DNS record identifiers to Reg.ru external IDs (service_id).
+// Cache is ephemeral — it does not survive pod restarts. Consistency
+// is maintained via reconciliation against the Reg.ru API.
 type ExternalIDCache struct {
-	mu       sync.RWMutex
-	entries  map[string]string // CacheKey.String() → external_id
-	filePath string            // empty = in-memory only
+	mu      sync.RWMutex
+	entries map[string]string // CacheKey.String() → external_id
 }
 
-// NewExternalIDCache creates a new cache. If filePath is non-empty,
-// the cache will be persisted to disk on writes and loaded on creation.
-func NewExternalIDCache(filePath string) (*ExternalIDCache, error) {
-	c := &ExternalIDCache{
-		entries:  make(map[string]string),
-		filePath: filePath,
+// NewExternalIDCache creates a new in-memory cache.
+func NewExternalIDCache() *ExternalIDCache {
+	return &ExternalIDCache{
+		entries: make(map[string]string),
 	}
-	if filePath != "" {
-		if err := c.load(); err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("cache load: %w", err)
-		}
-	}
-	return c, nil
 }
 
 // Get returns the external_id for the given key, or "" if not cached.
@@ -50,26 +40,18 @@ func (c *ExternalIDCache) Get(key CacheKey) string {
 	return c.entries[key.String()]
 }
 
-// Set stores the external_id for the given key and persists if configured.
-func (c *ExternalIDCache) Set(key CacheKey, externalID string) error {
+// Set stores the external_id for the given key.
+func (c *ExternalIDCache) Set(key CacheKey, externalID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries[key.String()] = externalID
-	if c.filePath != "" {
-		return c.saveLocked()
-	}
-	return nil
 }
 
 // Delete removes the entry for the given key.
-func (c *ExternalIDCache) Delete(key CacheKey) error {
+func (c *ExternalIDCache) Delete(key CacheKey) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.entries, key.String())
-	if c.filePath != "" {
-		return c.saveLocked()
-	}
-	return nil
 }
 
 // Len returns the number of entries in the cache.
@@ -107,51 +89,4 @@ func (c *ExternalIDCache) KeysByZone() map[string][]CacheKey {
 		}
 	}
 	return result
-}
-
-// load reads the cache from the JSON file. Caller must NOT hold the lock.
-func (c *ExternalIDCache) load() error {
-	data, err := os.ReadFile(c.filePath)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(data, &c.entries)
-}
-
-// saveLocked writes the cache to the JSON file atomically using a temp file + rename
-// pattern. This ensures the cache file is never partially written on crash.
-// Caller MUST hold c.mu write lock.
-func (c *ExternalIDCache) saveLocked() error {
-	data, err := json.MarshalIndent(c.entries, "", "  ")
-	if err != nil {
-		return fmt.Errorf("cache marshal: %w", err)
-	}
-
-	dir := filepath.Dir(c.filePath)
-	tmp, err := os.CreateTemp(dir, ".cache-*.tmp")
-	if err != nil {
-		return fmt.Errorf("cache create temp: %w", err)
-	}
-	tmpName := tmp.Name()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("cache write temp: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("cache sync: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("cache close temp: %w", err)
-	}
-
-	if err := os.Rename(tmpName, c.filePath); err != nil {
-		_ = os.Remove(tmpName)
-		return fmt.Errorf("cache rename: %w", err)
-	}
-	return nil
 }

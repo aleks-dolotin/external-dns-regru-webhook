@@ -270,4 +270,87 @@ The adapter classifies permission errors clearly:
 
 If you see permission errors in logs, verify the API user has the minimum permissions listed above.
 
+---
+
+## Operation Tracing (Story 6.4)
+
+Every DNS operation carries a unique `correlating_id` (UUID v4) from intake to completion. Use it to reconstruct the full timeline of any operation.
+
+### Pipeline stages traced
+
+1. **Event received** → `handleEvents` logs `event enqueued` with `correlating_id`
+2. **Queue dequeue** → worker logs `operation dequeued` with `correlating_id`
+3. **Rate-limit check** → worker logs `rate-limited` if throttled
+4. **Circuit-breaker check** → worker logs `rejected by circuit breaker` if open
+5. **Dispatch** → worker logs `dispatching to adapter` before API call
+6. **Retries** → worker logs each retry attempt with `correlating_id`
+7. **Result** → worker logs `operation succeeded` or `operation FAILED`
+8. **Audit event** → audit logger emits `audit_event` with `correlating_id`
+
+### kubectl + jq: trace a single operation
+
+```bash
+# Find all log entries for a specific correlating_id
+kubectl -n <NAMESPACE> logs -l app.kubernetes.io/name=reg-adapter --since=1h \
+  | jq -s 'sort_by(.timestamp) | .[] | select(.correlating_id == "<CORRELATING_ID>")'
+```
+
+### kubectl + jq: find operations for a zone
+
+```bash
+kubectl -n <NAMESPACE> logs -l app.kubernetes.io/name=reg-adapter --since=1h \
+  | jq 'select(.zone == "example.com")'
+```
+
+### Loki / Grafana query
+
+```logql
+{app="reg-adapter"} | json | correlating_id = "<CORRELATING_ID>"
+```
+
+Or search by zone:
+```logql
+{app="reg-adapter"} | json | zone = "example.com" | line_format "{{.timestamp}} {{.level}} {{.msg}} cid={{.correlating_id}}"
+```
+
+### Prometheus exemplar query
+
+Exemplars on `regru_api_request_duration_seconds_v2` carry `correlating_id`. In Grafana:
+
+1. Open a panel with `regru_api_request_duration_seconds_v2` histogram.
+2. Enable **Exemplars** toggle in the query options.
+3. Click any exemplar dot to see the `correlating_id` attached.
+
+### Timeline reconstruction steps
+
+1. Obtain the `correlating_id` from an alert, audit log, or metrics exemplar.
+2. Run the kubectl+jq query above to get all log entries for that ID.
+3. Sort by `timestamp` to form a timeline.
+4. Check `result` field for success/failure outcome.
+5. If failed, check `error_detail` in audit events and `error` in log entries.
+
+### Audit log queries
+
+Audit events are written to stdout as structured JSON with `audit=true` marker.
+They are collected by the cluster log aggregation system (Loki/ELK/CloudWatch).
+
+```bash
+# Loki query: all audit events for a specific correlating_id
+{app="reg-adapter"} | json | audit = "true" | correlating_id = "<ID>"
+
+# Loki query: all failures in the last 24h
+{app="reg-adapter"} | json | audit = "true" | result = "failure"
+
+# kubectl fallback: search audit events by correlating_id
+kubectl -n <NAMESPACE> logs -l app=reg-adapter --since=24h | \
+  jq -r 'select(.audit == true and .correlating_id == "<ID>")'
+```
+
+### Configuration: Audit
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `LOG_LEVEL` | info | Structured log level (debug, info, warn, error) |
+
+> **Note:** Audit retention (90 days) is managed by the cluster log aggregation platform (Loki/ELK retention policies), not by the application.
 

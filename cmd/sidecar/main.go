@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,10 +12,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/audit"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/circuitbreaker"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/config"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/health"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/logging"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/metrics"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/normalizer"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/queue"
@@ -25,11 +26,13 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
 )
 
 // app holds the wired application state, exposed for testing.
 type app struct {
 	mux         *http.ServeMux
+	logger      *zap.Logger // Story 6.2: structured logger
 	driver      auth.AuthDriver
 	reloader    *auth.ReloadableDriver // nil when rotation is disabled or initial load failed
 	credsValid  *int32                 // 1 = valid, 0 = invalid
@@ -40,6 +43,7 @@ type app struct {
 	configStore *config.Store           // zone-namespace mapping config (Story 3.1)
 	limiter     *ratelimit.ZoneLimiter  // Story 5.1: per-zone rate limiter
 	breaker     *circuitbreaker.Manager // Story 5.4: per-zone circuit breaker
+	auditor     audit.Auditor           // Story 6.3: audit trail
 }
 
 // diagnosticsSource bridges queue and worker to health.DiagnosticsSource.
@@ -126,18 +130,26 @@ func (d *diagnosticsSource) CircuitStates() map[string]string {
 // ReloadableDriver for hot rotation, builds the HTTP mux, and wires
 // /ready to credential validity.
 func newApp() *app {
+	// Story 6.2: initialize structured logger.
+	logLevel := os.Getenv("LOG_LEVEL")
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	logger := logging.NewLogger(logLevel)
+
 	a := &app{
 		mux:        http.NewServeMux(),
+		logger:     logger,
 		credsValid: new(int32),
 	}
 
 	// --- driver loading via pluggable factory ---
 	driver, err := auth.NewDriverFromEnv()
 	if err != nil {
-		log.Printf("WARNING: auth driver not available: %v (adapter will not be ready)", err)
+		logger.Warn("auth driver not available", zap.Error(err), zap.String("impact", "adapter will not be ready"))
 	} else {
 		atomic.StoreInt32(a.credsValid, 1)
-		log.Printf("auth driver loaded successfully (type: %s)", os.Getenv(auth.EnvAuthDriver))
+		logger.Info("auth driver loaded successfully", zap.String("type", os.Getenv(auth.EnvAuthDriver)))
 
 		// --- credential rotation ---
 		interval := rotationInterval()
@@ -146,7 +158,7 @@ func newApp() *app {
 			atomic.StoreInt32(a.credsValid, 1)
 		}
 		rd.OnReloadError = func(e error) {
-			log.Printf("credential reload failed (old creds still active): %v", e)
+			logger.Error("credential reload failed", zap.Error(e), zap.String("impact", "old creds still active"))
 		}
 		a.reloader = rd
 		a.driver = rd // adapter uses reloadable wrapper
@@ -173,11 +185,23 @@ func newApp() *app {
 
 	// --- Prometheus metrics ---
 	metrics.Register(prometheus.DefaultRegisterer)
-	a.mux.Handle("/metrics", promhttp.Handler())
+	// Story 6.4: enable OpenMetrics format to expose exemplars with correlating_id.
+	a.mux.Handle("/metrics", promhttp.HandlerFor(
+		prometheus.DefaultGatherer,
+		promhttp.HandlerOpts{EnableOpenMetrics: true},
+	))
 
 	// --- diagnostics endpoint (Story 10.2) ---
 	a.queue = queue.New()
 	a.pool = worker.New(nil, a.queue) // adapter wired when Epic 1 adapter is instantiated
+	a.pool.SetLogger(logger)          // Story 6.2: inject structured logger
+
+	// Story 6.4: inject structured logger into normalizer for tracing.
+	normalizer.SetLogger(logger)
+
+	// --- Story 6.3: audit trail (stdout via zap → cluster log aggregation) ---
+	a.auditor = audit.NewLogAuditor(logger)
+	a.pool.SetAuditor(a.auditor)
 
 	// --- Story 5.1: per-zone rate limiter ---
 	a.limiter = ratelimit.NewZoneLimiter(ratelimit.Config{
@@ -192,7 +216,11 @@ func newApp() *app {
 	a.breaker = circuitbreaker.NewManager(circuitbreaker.DefaultConfig())
 	a.breaker.OnStateChange = func(zone string, from, to circuitbreaker.State) {
 		metrics.CircuitState.WithLabelValues(zone).Set(float64(to))
-		log.Printf("circuit breaker: zone %s %s → %s", zone, from, to)
+		logger.Info("circuit breaker state change",
+			zap.String("zone", zone),
+			zap.String("from", from.String()),
+			zap.String("to", to.String()),
+		)
 	}
 	a.pool.SetCircuitBreakers(a.breaker)
 
@@ -209,10 +237,10 @@ func newApp() *app {
 	}
 	cfgStore, err := config.NewStore(cfgPath)
 	if err != nil {
-		log.Printf("WARNING: config store not loaded: %v (will retry via hot-reload)", err)
+		logger.Warn("config store not loaded", zap.Error(err), zap.String("impact", "will retry via hot-reload"))
 	} else {
 		a.configStore = cfgStore
-		log.Printf("config store loaded: %d zone mappings from %s", len(cfgStore.Get().Zones), cfgPath)
+		logger.Info("config store loaded", zap.Int("zone_count", len(cfgStore.Get().Zones)), zap.String("path", cfgPath))
 	}
 
 	return a
@@ -232,6 +260,9 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"invalid JSON: `+err.Error()+`"}`, http.StatusBadRequest)
 		return
 	}
+
+	// Story 6.4: log event receipt for end-to-end tracing (receive step).
+	a.logger.Info("events received", zap.Int("count", len(events)))
 
 	ops, errs := normalizer.NormalizeBatch(events)
 
@@ -255,8 +286,11 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 				labels := extractLabels(ops[i].K8sMeta)
 				fqdn, err := config.RenderFQDNForZone(zm, ops[i].ResourceRef.Name, namespace, labels)
 				if err != nil {
-					log.Printf("WARNING: FQDN template failed for op %s: %v (keeping original FQDN)",
-						ops[i].OpID, err)
+					a.logger.Warn("FQDN template failed",
+						zap.String("correlating_id", ops[i].OpID),
+						zap.Error(err),
+						zap.String("impact", "keeping original FQDN"),
+					)
 				} else {
 					ops[i].Name = fqdn
 				}
@@ -275,6 +309,15 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 			ID:   ops[i].OpID,
 			Body: ops[i],
 		})
+		// Story 6.4: log enqueue with correlating_id for end-to-end tracing.
+		a.logger.Info("event enqueued",
+			zap.String("correlating_id", ops[i].OpID),
+			zap.String("zone", ops[i].Zone),
+			zap.String("operation", ops[i].Action),
+			zap.String("fqdn", ops[i].Name),
+			zap.String("record_type", ops[i].Type),
+			zap.String("namespace", ops[i].ResourceRef.Namespace),
+		)
 		accepted++
 	}
 
@@ -393,22 +436,22 @@ func main() {
 	// Start worker pool with configurable concurrency (Story 2.4).
 	concurrency := workerConcurrency()
 	a.pool.Start(ctx, concurrency)
-	log.Printf("worker pool started with %d workers", concurrency)
+	a.logger.Info("worker pool started", zap.Int("workers", concurrency))
 
 	go func() {
-		log.Println("sidecar starting on :8080")
+		a.logger.Info("sidecar starting", zap.String("addr", ":8080"))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %s\n", err)
+			a.logger.Fatal("listen failed", zap.Error(err))
 		}
 	}()
 
 	<-ctx.Done()
-	log.Println("sidecar shutting down...")
+	a.logger.Info("sidecar shutting down")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
+		a.logger.Fatal("server forced to shutdown", zap.Error(err))
 	}
-	log.Println("sidecar stopped")
+	a.logger.Info("sidecar stopped")
 }

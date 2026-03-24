@@ -825,10 +825,7 @@ func TestUpdateRecord_NoDuplicates(t *testing.T) {
 
 func newTestAdapterWithCache(t *testing.T, handler http.HandlerFunc) (*HTTPAdapter, *ExternalIDCache) {
 	t.Helper()
-	cache, err := NewExternalIDCache("")
-	if err != nil {
-		t.Fatalf("NewExternalIDCache: %v", err)
-	}
+	cache := NewExternalIDCache()
 	adapter := newTestAdapter(t, handler)
 	adapter.SetCache(cache)
 	return adapter, cache
@@ -891,7 +888,7 @@ func TestCacheIntegration_DeleteRecord_EvictsCache(t *testing.T) {
 
 	// Pre-populate cache
 	key := CacheKey{Zone: "example.com", Name: "www", RecType: "A"}
-	_ = cache.Set(key, "12345")
+	cache.Set(key, "12345")
 
 	if err := adapter.DeleteRecord("example.com", "www:A:1.2.3.4"); err != nil {
 		t.Fatalf("DeleteRecord: %v", err)
@@ -911,7 +908,7 @@ func TestCacheIntegration_LookupExternalID_CacheHit(t *testing.T) {
 
 	// Pre-populate cache
 	key := CacheKey{Zone: "example.com", Name: "www", RecType: "A"}
-	_ = cache.Set(key, "cached-id")
+	cache.Set(key, "cached-id")
 
 	id, err := adapter.LookupExternalID("example.com", "www", "A")
 	if err != nil {
@@ -959,7 +956,7 @@ func TestCacheIntegration_ReconcileCache_EvictsStale(t *testing.T) {
 
 	// Pre-populate cache with stale entry
 	key := CacheKey{Zone: "example.com", Name: "gone", RecType: "A"}
-	_ = cache.Set(key, "stale-id")
+	cache.Set(key, "stale-id")
 
 	ctx := context.Background()
 	adapter.ReconcileCache(ctx)
@@ -991,10 +988,10 @@ func TestCacheIntegration_ReconcileCache_OneRequestPerZone(t *testing.T) {
 	})
 
 	// Pre-populate: 3 entries in example.com, 1 in other.com = 2 API calls total
-	_ = cache.Set(CacheKey{Zone: "example.com", Name: "www", RecType: "A"}, "id1")
-	_ = cache.Set(CacheKey{Zone: "example.com", Name: "mail", RecType: "CNAME"}, "id2")
-	_ = cache.Set(CacheKey{Zone: "example.com", Name: "gone", RecType: "TXT"}, "id3") // stale
-	_ = cache.Set(CacheKey{Zone: "other.com", Name: "app", RecType: "A"}, "id4")
+	cache.Set(CacheKey{Zone: "example.com", Name: "www", RecType: "A"}, "id1")
+	cache.Set(CacheKey{Zone: "example.com", Name: "mail", RecType: "CNAME"}, "id2")
+	cache.Set(CacheKey{Zone: "example.com", Name: "gone", RecType: "TXT"}, "id3") // stale
+	cache.Set(CacheKey{Zone: "other.com", Name: "app", RecType: "A"}, "id4")
 
 	ctx := context.Background()
 	adapter.ReconcileCache(ctx)
@@ -1026,7 +1023,7 @@ func TestCacheIntegration_ReconcileCache_ZoneAPIError_SkipsZone(t *testing.T) {
 	})
 
 	key := CacheKey{Zone: "example.com", Name: "www", RecType: "A"}
-	_ = cache.Set(key, "keep-me")
+	cache.Set(key, "keep-me")
 
 	ctx := context.Background()
 	adapter.ReconcileCache(ctx)

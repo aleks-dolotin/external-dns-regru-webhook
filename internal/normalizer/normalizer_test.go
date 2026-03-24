@@ -1,10 +1,14 @@
 package normalizer
 
 import (
+	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/adapter"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func TestNormalize_ValidEvent(t *testing.T) {
@@ -297,6 +301,61 @@ func TestGenerateUUID_Format(t *testing.T) {
 	for i, p := range parts {
 		if len(p) != expectedLens[i] {
 			t.Errorf("group %d: expected %d chars, got %d in %q", i, expectedLens[i], len(p), id)
+		}
+	}
+}
+
+func TestNormalize_EmitsStructuredLogWithCorrelatingID(t *testing.T) {
+	// Story 6.4: verify normalize step logs correlating_id for end-to-end tracing.
+	var buf bytes.Buffer
+	encoderCfg := zapcore.EncoderConfig{
+		TimeKey:     "timestamp",
+		LevelKey:    "level",
+		MessageKey:  "msg",
+		EncodeLevel: zapcore.LowercaseLevelEncoder,
+		EncodeTime:  zapcore.ISO8601TimeEncoder,
+	}
+	core := zapcore.NewCore(
+		zapcore.NewJSONEncoder(encoderCfg),
+		zapcore.AddSync(&buf),
+		zapcore.DebugLevel,
+	)
+	testLogger := zap.New(core)
+
+	// Inject test logger into normalizer package.
+	oldLogger := logger
+	SetLogger(testLogger)
+	defer SetLogger(oldLogger)
+
+	event := DNSEndpointEvent{
+		ResourceRef: adapter.ResourceRef{Name: "my-svc", Namespace: "prod"},
+		Zone:        "example.com",
+		FQDN:        "app.example.com",
+		RecordType:  "A",
+		Action:      "create",
+	}
+
+	op, err := Normalize(event)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var entry map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("failed to parse JSON log: %v", err)
+	}
+
+	// Verify required tracing fields.
+	if entry["msg"] != "event normalized" {
+		t.Errorf("expected msg='event normalized', got %v", entry["msg"])
+	}
+	if entry["correlating_id"] != op.OpID {
+		t.Errorf("expected correlating_id=%q, got %v", op.OpID, entry["correlating_id"])
+	}
+	requiredFields := []string{"zone", "operation", "fqdn", "record_type", "resource", "namespace"}
+	for _, f := range requiredFields {
+		if _, ok := entry[f]; !ok {
+			t.Errorf("expected field %q in normalize log, not found", f)
 		}
 	}
 }

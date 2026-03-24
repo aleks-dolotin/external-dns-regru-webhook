@@ -45,12 +45,16 @@ type HTTPAdapter struct {
 	cache      *ExternalIDCache // optional; nil = no caching
 }
 
+// DefaultBaseURL is the production Reg.ru API v2 endpoint.
+const DefaultBaseURL = "https://api.reg.ru/api/regru2"
+
 // NewHTTPAdapter creates an HTTPAdapter with the given AuthDriver for request authentication.
 // If driver is nil, requests are sent without authentication credentials.
+// Base URL is read from REGRU_BASE_URL env var; defaults to the production Reg.ru API.
 func NewHTTPAdapter(driver auth.AuthDriver) *HTTPAdapter {
 	base := os.Getenv("REGRU_BASE_URL")
 	if base == "" {
-		base = "http://localhost:8081/api/regru2"
+		base = DefaultBaseURL
 	}
 	return &HTTPAdapter{
 		client:     &http.Client{Timeout: 10 * time.Second},
@@ -69,14 +73,14 @@ func (h *HTTPAdapter) SetCache(c *ExternalIDCache) {
 // cacheSet stores an external_id in the cache (no-op if cache is nil or id is empty).
 func (h *HTTPAdapter) cacheSet(zone, name, recType, id string) {
 	if h.cache != nil && id != "" {
-		_ = h.cache.Set(CacheKey{Zone: zone, Name: name, RecType: recType}, id)
+		h.cache.Set(CacheKey{Zone: zone, Name: name, RecType: recType}, id)
 	}
 }
 
 // cacheEvict removes an entry from the cache (no-op if cache is nil).
 func (h *HTTPAdapter) cacheEvict(zone, name, recType string) {
 	if h.cache != nil {
-		_ = h.cache.Delete(CacheKey{Zone: zone, Name: name, RecType: recType})
+		h.cache.Delete(CacheKey{Zone: zone, Name: name, RecType: recType})
 	}
 }
 

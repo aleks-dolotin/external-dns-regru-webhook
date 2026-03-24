@@ -8,7 +8,20 @@ import (
 	"time"
 
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/adapter"
+	"go.uber.org/zap"
 )
+
+// logger is the package-level structured logger. Defaults to no-op.
+// Use SetLogger to inject a real logger (Story 6.4).
+var logger = zap.NewNop()
+
+// SetLogger sets the package-level structured logger. Nil reverts to no-op.
+func SetLogger(l *zap.Logger) {
+	if l == nil {
+		l = zap.NewNop()
+	}
+	logger = l
+}
 
 // validActions defines allowed operation actions.
 var validActions = map[string]struct{}{
@@ -56,6 +69,17 @@ func Normalize(event DNSEndpointEvent) (adapter.Operation, error) {
 	if err != nil {
 		return adapter.Operation{}, fmt.Errorf("normalizer: failed to generate correlating_id: %w", err)
 	}
+
+	// Story 6.4: log normalization step with correlating_id for end-to-end tracing.
+	logger.Debug("event normalized",
+		zap.String("correlating_id", opID),
+		zap.String("zone", event.Zone),
+		zap.String("operation", event.Action),
+		zap.String("fqdn", event.FQDN),
+		zap.String("record_type", event.RecordType),
+		zap.String("resource", event.ResourceRef.Name),
+		zap.String("namespace", event.ResourceRef.Namespace),
+	)
 
 	return adapter.Operation{
 		OpID:        opID,

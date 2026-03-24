@@ -4,16 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/adapter"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/audit"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/logging"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/metrics"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/queue"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/ratelimit"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/retry"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
 )
 
 // ZoneError holds the last error information for a zone.
@@ -38,6 +41,8 @@ type WorkerPool struct {
 	retryPolicy retry.Policy
 	limiter     *ratelimit.ZoneLimiter // Story 5.1: per-zone rate limiter (nil = disabled)
 	breaker     CircuitBreakers        // Story 5.4: per-zone circuit breaker (nil = disabled)
+	logger      *zap.Logger            // Story 6.2: structured logger (nil = nop)
+	auditor     audit.Auditor          // Story 6.3: audit trail (nil = nop)
 	wg          sync.WaitGroup
 	stop        chan struct{}
 	workerCount int32 // atomic: running workers
@@ -66,9 +71,27 @@ func New(adapter adapter.Adapter, q *queue.InMemoryQueue) *WorkerPool {
 		adapter:     adapter,
 		queue:       q,
 		retryPolicy: retry.DefaultPolicy,
+		logger:      zap.NewNop(),
+		auditor:     audit.Nop(),
 		stop:        make(chan struct{}),
 		lastErrors:  make(map[string]ZoneError),
 	}
+}
+
+// SetLogger attaches a structured logger (Story 6.2). Nil reverts to no-op.
+func (p *WorkerPool) SetLogger(l *zap.Logger) {
+	if l == nil {
+		l = zap.NewNop()
+	}
+	p.logger = l
+}
+
+// SetAuditor attaches an audit recorder (Story 6.3). Nil reverts to no-op.
+func (p *WorkerPool) SetAuditor(a audit.Auditor) {
+	if a == nil {
+		a = audit.Nop()
+	}
+	p.auditor = a
 }
 
 // SetRetryPolicy overrides the default retry policy.
@@ -129,22 +152,34 @@ func (p *WorkerPool) Start(ctx context.Context, workers int) {
 
 func (p *WorkerPool) workerLoop(ctx context.Context, id int) {
 	defer p.wg.Done()
-	defer atomic.AddInt32(&p.workerCount, -1)
-	log.Printf("worker %d started", id)
+	defer func() {
+		atomic.AddInt32(&p.workerCount, -1)
+		// Story 6.1: update gauge after worker exits.
+		metrics.WorkerCountGauge.Set(float64(atomic.LoadInt32(&p.workerCount)))
+	}()
+	p.logger.Info("worker started", zap.Int("worker_id", id))
+	// Story 6.1: update gauge after worker starts.
+	metrics.WorkerCountGauge.Set(float64(atomic.LoadInt32(&p.workerCount)))
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("worker %d stopping: context done", id)
+			p.logger.Info("worker stopping: context done", zap.Int("worker_id", id))
 			return
 		case <-p.stop:
-			log.Printf("worker %d stopping: stop signal", id)
+			p.logger.Info("worker stopping: stop signal", zap.Int("worker_id", id))
 			return
 		default:
 			op := p.queue.Dequeue()
 			if op == nil {
+				// Story 6.1: update queue depth gauge even on empty poll.
+				metrics.QueueDepth.Set(float64(p.queue.Len()))
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
+			// Story 6.1: update queue depth after dequeue.
+			metrics.QueueDepth.Set(float64(p.queue.Len()))
+			// Story 6.4: log dequeue with correlating_id.
+			p.logger.Debug("operation dequeued", zap.String("correlating_id", op.ID))
 			p.handleWithRetry(ctx, op)
 		}
 	}
@@ -154,14 +189,31 @@ func (p *WorkerPool) workerLoop(ctx context.Context, id int) {
 func (p *WorkerPool) handleWithRetry(ctx context.Context, op *queue.Operation) {
 	adapterOp, ok := op.Body.(adapter.Operation)
 	if !ok {
-		log.Printf("worker: skipping op %s: body is not adapter.Operation (type %T)", op.ID, op.Body)
+		p.logger.Warn("skipping operation: body is not adapter.Operation",
+			zap.String("op_id", op.ID),
+			zap.String("body_type", fmt.Sprintf("%T", op.Body)),
+		)
 		return
 	}
+
+	// Story 6.2: build per-operation logger with correlating_id and structured fields.
+	opLog := p.logger.With(
+		zap.String("correlating_id", adapterOp.OpID),
+		zap.String("zone", adapterOp.Zone),
+		zap.String("operation", adapterOp.Action),
+		zap.String("resource", adapterOp.ResourceRef.Name),
+		zap.String("namespace", adapterOp.ResourceRef.Namespace),
+		zap.String("record_type", adapterOp.Type),
+	)
+
+	// Story 6.4 (review fix): propagate structured logger into context so that
+	// downstream layers (adapter, dispatch) can extract it via logging.FromContext.
+	ctx = logging.WithContext(ctx, opLog)
 
 	// Story 5.4: check circuit breaker before processing.
 	if p.breaker != nil {
 		if err := p.breaker.AllowRequest(adapterOp.Zone); err != nil {
-			log.Printf("worker: op %s rejected by circuit breaker for zone %s: %v", op.ID, adapterOp.Zone, err)
+			opLog.Warn("rejected by circuit breaker", zap.Error(err))
 			p.recordZoneError(adapterOp.Zone, err)
 			// Re-enqueue for later retry when circuit closes.
 			p.queue.Enqueue(*op)
@@ -172,7 +224,7 @@ func (p *WorkerPool) handleWithRetry(ctx context.Context, op *queue.Operation) {
 	// Story 5.1: enforce per-zone rate limit before dispatch.
 	if p.limiter != nil {
 		if err := p.limiter.Wait(ctx, adapterOp.Zone); err != nil {
-			log.Printf("worker: op %s rate-limited for zone %s: %v", op.ID, adapterOp.Zone, err)
+			opLog.Warn("rate-limited", zap.Error(err))
 			metrics.RateLimitedTotal.WithLabelValues(adapterOp.Zone).Inc()
 			// Re-enqueue so the operation is not lost.
 			p.queue.Enqueue(*op)
@@ -184,7 +236,22 @@ func (p *WorkerPool) handleWithRetry(ctx context.Context, op *queue.Operation) {
 	var lastRetryAfterWait time.Duration
 	result := p.retryPolicy.DoWithRetryAfter(ctx, func() error {
 		lastRetryAfterWait = 0 // reset per attempt
+		// Story 6.1: wrap dispatch with timer for RequestDurationV2.
+		start := time.Now()
+		// Story 6.4: log dispatch start for tracing.
+		opLog.Debug("dispatching to adapter")
 		err := p.dispatch(adapterOp)
+		duration := time.Since(start).Seconds()
+
+		// Story 6.1: record V2 duration (every attempt, regardless of outcome).
+		// Story 6.4: attach correlating_id as exemplar for request-level tracing.
+		observer := metrics.RequestDurationV2.WithLabelValues(adapterOp.Zone, adapterOp.Type, adapterOp.Action)
+		if eo, ok := observer.(prometheus.ExemplarObserver); ok {
+			eo.ObserveWithExemplar(duration, prometheus.Labels{"correlating_id": adapterOp.OpID})
+		} else {
+			observer.Observe(duration)
+		}
+
 		if err != nil {
 			// Extract Retry-After duration from 429/503 responses (Story 5.2).
 			var raErr *adapter.RetryAfterError
@@ -202,7 +269,11 @@ func (p *WorkerPool) handleWithRetry(ctx context.Context, op *queue.Operation) {
 		}
 		metrics.RetriesTotal.Inc()
 		metrics.APIRetriesTotal.WithLabelValues(adapterOp.Zone, reason).Inc()
-		log.Printf("worker: retrying op %s (attempt %d, reason=%s): %v", op.ID, attempt, reason, err)
+		opLog.Warn("retrying operation",
+			zap.Int("attempt", attempt),
+			zap.String("reason", reason),
+			zap.Error(err),
+		)
 	}, func(wait time.Duration) {
 		metrics.APIBackoffSeconds.WithLabelValues(adapterOp.Zone).Observe(wait.Seconds())
 	})
@@ -212,17 +283,51 @@ func (p *WorkerPool) handleWithRetry(ctx context.Context, op *queue.Operation) {
 		if p.breaker != nil {
 			p.breaker.RecordSuccess(adapterOp.Zone)
 		}
+		// Story 6.1: record V2 request counter (success).
+		metrics.RequestsTotalV2.WithLabelValues(adapterOp.Zone, adapterOp.Type, adapterOp.Action, "success").Inc()
 		p.mu.Lock()
 		p.lastHeartbeat = time.Now().UTC()
 		p.mu.Unlock()
-		log.Printf("worker: op %s succeeded after %d attempt(s)", op.ID, result.Attempts)
+		opLog.Info("operation succeeded", zap.Int("attempts", result.Attempts))
+		// Story 6.3: record audit event on success.
+		p.auditor.Record(audit.AuditEvent{
+			Timestamp:     time.Now().UTC(),
+			Operation:     adapterOp.Action,
+			Actor:         "system",
+			Zone:          adapterOp.Zone,
+			FQDN:          adapterOp.Name,
+			RecordType:    adapterOp.Type,
+			CorrelatingID: adapterOp.OpID,
+			Result:        "success",
+		})
 	} else {
 		// Story 5.4: record failure for circuit breaker.
 		if p.breaker != nil {
 			p.breaker.RecordFailure(adapterOp.Zone)
 		}
+		// Story 6.1: record V2 request counter (failure).
+		metrics.RequestsTotalV2.WithLabelValues(adapterOp.Zone, adapterOp.Type, adapterOp.Action, "failure").Inc()
 		// Dead-letter: max retries exhausted
-		log.Printf("worker: op %s FAILED after %d attempts: %v", op.ID, result.Attempts, result.Err)
+		opLog.Error("operation FAILED",
+			zap.Int("attempts", result.Attempts),
+			zap.Error(result.Err),
+		)
+		// Story 6.3: record audit event on failure.
+		errDetail := ""
+		if result.Err != nil {
+			errDetail = result.Err.Error()
+		}
+		p.auditor.Record(audit.AuditEvent{
+			Timestamp:     time.Now().UTC(),
+			Operation:     adapterOp.Action,
+			Actor:         "system",
+			Zone:          adapterOp.Zone,
+			FQDN:          adapterOp.Name,
+			RecordType:    adapterOp.Type,
+			CorrelatingID: adapterOp.OpID,
+			Result:        "failure",
+			ErrorDetail:   errDetail,
+		})
 		metrics.FailedOpsTotal.WithLabelValues(adapterOp.Action).Inc()
 		p.recordZoneError(adapterOp.Zone, result.Err)
 		p.mu.Lock()
