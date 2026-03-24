@@ -3,6 +3,7 @@ package retry
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -201,5 +202,123 @@ func TestDo_ConcurrentSafe(t *testing.T) {
 	}
 	if atomic.LoadInt64(&count) != 10 {
 		t.Errorf("expected 10 calls, got %d", count)
+	}
+}
+
+// --- Story 5.2: ParseRetryAfter and DoWithRetryAfter tests ---
+
+func TestParseRetryAfter_Seconds(t *testing.T) {
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("Retry-After", "30")
+	info := ParseRetryAfter(resp)
+	if info.Wait != 30*time.Second {
+		t.Errorf("expected 30s, got %v", info.Wait)
+	}
+	if info.Reason != "retry-after-header" {
+		t.Errorf("expected reason retry-after-header, got %s", info.Reason)
+	}
+}
+
+func TestParseRetryAfter_HTTPDate(t *testing.T) {
+	future := time.Now().Add(60 * time.Second)
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("Retry-After", future.UTC().Format(http.TimeFormat))
+	info := ParseRetryAfter(resp)
+	// Should be roughly 60 seconds (within tolerance).
+	if info.Wait < 50*time.Second || info.Wait > 70*time.Second {
+		t.Errorf("expected ~60s, got %v", info.Wait)
+	}
+}
+
+func TestParseRetryAfter_Empty(t *testing.T) {
+	resp := &http.Response{Header: http.Header{}}
+	info := ParseRetryAfter(resp)
+	if info.Wait != 0 {
+		t.Errorf("expected 0, got %v", info.Wait)
+	}
+}
+
+func TestParseRetryAfter_NilResponse(t *testing.T) {
+	info := ParseRetryAfter(nil)
+	if info.Wait != 0 {
+		t.Errorf("expected 0, got %v", info.Wait)
+	}
+}
+
+func TestDoWithRetryAfter_HonorsRetryAfterHeader(t *testing.T) {
+	p := Policy{MaxAttempts: 3, InitialBackoff: time.Millisecond, MaxBackoff: 5 * time.Second, Jitter: false}
+
+	calls := 0
+	retryAfterWait := 10 * time.Millisecond
+	var observedBackoff time.Duration
+
+	r := p.DoWithRetryAfter(context.Background(),
+		func() error {
+			calls++
+			if calls < 2 {
+				return errors.New("429")
+			}
+			return nil
+		},
+		func() time.Duration { return retryAfterWait },
+		nil,
+		func(wait time.Duration) { observedBackoff = wait },
+	)
+
+	if !r.Success {
+		t.Error("expected success")
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 calls, got %d", calls)
+	}
+	if observedBackoff != retryAfterWait {
+		t.Errorf("expected backoff %v from Retry-After, got %v", retryAfterWait, observedBackoff)
+	}
+}
+
+func TestDoWithRetryAfter_FallsBackToExponential(t *testing.T) {
+	p := Policy{MaxAttempts: 3, InitialBackoff: time.Millisecond, MaxBackoff: time.Second, Jitter: false}
+
+	calls := 0
+	var backoffs []time.Duration
+
+	p.DoWithRetryAfter(context.Background(),
+		func() error {
+			calls++
+			if calls < 3 {
+				return errors.New("500")
+			}
+			return nil
+		},
+		func() time.Duration { return 0 }, // no Retry-After
+		nil,
+		func(wait time.Duration) { backoffs = append(backoffs, wait) },
+	)
+
+	if len(backoffs) != 2 {
+		t.Fatalf("expected 2 backoffs, got %d", len(backoffs))
+	}
+	// First backoff = InitialBackoff = 1ms, second = 2ms.
+	if backoffs[0] != time.Millisecond {
+		t.Errorf("first backoff: expected 1ms, got %v", backoffs[0])
+	}
+	if backoffs[1] != 2*time.Millisecond {
+		t.Errorf("second backoff: expected 2ms, got %v", backoffs[1])
+	}
+}
+
+func TestDoWithRetryAfter_CapsRetryAfterToMaxBackoff(t *testing.T) {
+	p := Policy{MaxAttempts: 2, InitialBackoff: time.Millisecond, MaxBackoff: 50 * time.Millisecond, Jitter: false}
+
+	var observedBackoff time.Duration
+	p.DoWithRetryAfter(context.Background(),
+		func() error { return errors.New("429") },
+		func() time.Duration { return 10 * time.Second }, // way over MaxBackoff
+		nil,
+		func(wait time.Duration) { observedBackoff = wait },
+	)
+
+	if observedBackoff != 50*time.Millisecond {
+		t.Errorf("expected capped to 50ms, got %v", observedBackoff)
 	}
 }

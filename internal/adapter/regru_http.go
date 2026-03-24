@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,20 @@ var ErrPermissionDenied = errors.New("adapter: permission denied — verify cred
 
 // ErrAuthenticationFailed is returned when the API rejects the provided credentials.
 var ErrAuthenticationFailed = errors.New("adapter: authentication failed — check credentials")
+
+// RetryAfterError wraps an HTTP 429 (or 503) error with the parsed Retry-After
+// duration so callers can honor the server's requested backoff (Story 5.2).
+type RetryAfterError struct {
+	StatusCode int
+	Wait       time.Duration
+	Wrapped    error
+}
+
+func (e *RetryAfterError) Error() string {
+	return fmt.Sprintf("adapter: HTTP %d — retry after %s: %v", e.StatusCode, e.Wait, e.Wrapped)
+}
+
+func (e *RetryAfterError) Unwrap() error { return e.Wrapped }
 
 // HTTPAdapter is a simple implementation that posts to Reg.ru-like endpoints
 type HTTPAdapter struct {
@@ -187,8 +202,14 @@ func (h *HTTPAdapter) authParams() map[string]string {
 }
 
 // classifyHTTPError maps HTTP status codes to domain-specific errors.
+// For 429/503 responses with a Retry-After header, it returns a RetryAfterError (Story 5.2).
 func classifyHTTPError(resp *http.Response) error {
 	switch {
+	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable:
+		wait := parseRetryAfterDuration(resp)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		base := fmt.Errorf("reg.ru returned status %d: %s", resp.StatusCode, string(body))
+		return &RetryAfterError{StatusCode: resp.StatusCode, Wait: wait, Wrapped: base}
 	case resp.StatusCode == http.StatusForbidden:
 		return fmt.Errorf("%w (HTTP %d)", ErrPermissionDenied, resp.StatusCode)
 	case resp.StatusCode == http.StatusUnauthorized:
@@ -198,6 +219,26 @@ func classifyHTTPError(resp *http.Response) error {
 		return fmt.Errorf("reg.ru returned status %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+// parseRetryAfterDuration extracts the Retry-After header as a duration.
+// Supports integer seconds and HTTP-date formats per RFC 7231.
+func parseRetryAfterDuration(resp *http.Response) time.Duration {
+	val := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if val == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(val); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(val); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			d = 0
+		}
+		return d
+	}
+	return 0
 }
 
 // classifyAPIError inspects the Reg.ru JSON response body for permission errors.

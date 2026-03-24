@@ -14,11 +14,13 @@ import (
 	"time"
 
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/circuitbreaker"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/config"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/health"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/metrics"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/normalizer"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/queue"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/ratelimit"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/worker"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -32,17 +34,21 @@ type app struct {
 	reloader    *auth.ReloadableDriver // nil when rotation is disabled or initial load failed
 	credsValid  *int32                 // 1 = valid, 0 = invalid
 	checker     *health.Checker
-	diagSrc     *diagnosticsSource   // diagnostics data source (Story 10.2)
-	queue       *queue.InMemoryQueue // event queue (Story 2.1)
-	pool        *worker.WorkerPool   // worker pool (Story 2.4)
-	configStore *config.Store        // zone-namespace mapping config (Story 3.1)
+	diagSrc     *diagnosticsSource      // diagnostics data source (Story 10.2)
+	queue       *queue.InMemoryQueue    // event queue (Story 2.1)
+	pool        *worker.WorkerPool      // worker pool (Story 2.4)
+	configStore *config.Store           // zone-namespace mapping config (Story 3.1)
+	limiter     *ratelimit.ZoneLimiter  // Story 5.1: per-zone rate limiter
+	breaker     *circuitbreaker.Manager // Story 5.4: per-zone circuit breaker
 }
 
 // diagnosticsSource bridges queue and worker to health.DiagnosticsSource.
 // Nil-safe: returns zero values when components are not yet wired.
 type diagnosticsSource struct {
-	q *queue.InMemoryQueue
-	p *worker.WorkerPool
+	q   *queue.InMemoryQueue
+	p   *worker.WorkerPool
+	lim *ratelimit.ZoneLimiter  // Story 5.1/5.5
+	cb  *circuitbreaker.Manager // Story 5.4
 }
 
 func (d *diagnosticsSource) QueueDepth() int {
@@ -80,6 +86,38 @@ func (d *diagnosticsSource) ZoneErrors() map[string]health.ZoneErrorInfo {
 			Message: ze.Message,
 			Time:    ze.Time,
 		}
+	}
+	return result
+}
+
+// IsBackpressured returns true when the queue depth exceeds the threshold (Story 5.5).
+func (d *diagnosticsSource) IsBackpressured() bool {
+	if d.q == nil {
+		return false
+	}
+	return d.q.IsBackpressured()
+}
+
+// ThrottledZones returns zones where the rate limiter is actively throttling (Story 5.5).
+func (d *diagnosticsSource) ThrottledZones() []string {
+	if d.lim == nil {
+		return nil
+	}
+	return d.lim.ThrottledZones()
+}
+
+// CircuitStates returns per-zone circuit breaker states (Story 5.4).
+func (d *diagnosticsSource) CircuitStates() map[string]string {
+	if d.cb == nil {
+		return nil
+	}
+	states := d.cb.ZoneStates()
+	if len(states) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(states))
+	for zone, st := range states {
+		result[zone] = st.String()
 	}
 	return result
 }
@@ -140,7 +178,25 @@ func newApp() *app {
 	// --- diagnostics endpoint (Story 10.2) ---
 	a.queue = queue.New()
 	a.pool = worker.New(nil, a.queue) // adapter wired when Epic 1 adapter is instantiated
-	a.diagSrc = &diagnosticsSource{q: a.queue, p: a.pool}
+
+	// --- Story 5.1: per-zone rate limiter ---
+	a.limiter = ratelimit.NewZoneLimiter(ratelimit.Config{
+		RatePerHour: rateLimitPerHour(),
+	})
+	a.limiter.SetOnLimited(func(zone string) {
+		metrics.RateLimitedTotal.WithLabelValues(zone).Inc()
+	})
+	a.pool.SetLimiter(a.limiter)
+
+	// --- Story 5.4: per-zone circuit breaker ---
+	a.breaker = circuitbreaker.NewManager(circuitbreaker.DefaultConfig())
+	a.breaker.OnStateChange = func(zone string, from, to circuitbreaker.State) {
+		metrics.CircuitState.WithLabelValues(zone).Set(float64(to))
+		log.Printf("circuit breaker: zone %s %s → %s", zone, from, to)
+	}
+	a.pool.SetCircuitBreakers(a.breaker)
+
+	a.diagSrc = &diagnosticsSource{q: a.queue, p: a.pool, lim: a.limiter, cb: a.breaker}
 	a.mux.HandleFunc("/adapter/v1/diagnostics", health.DiagnosticsHandler(a.diagSrc))
 
 	// --- event intake endpoint (Story 2.1) ---
@@ -297,6 +353,20 @@ func workerConcurrency() int {
 		return DefaultWorkerConcurrency
 	}
 	return n
+}
+
+// rateLimitPerHour reads REGADAPTER_RATE_PER_HOUR from env (Story 5.1).
+// Returns 0 (use default) if not set or invalid.
+func rateLimitPerHour() float64 {
+	s := os.Getenv("REGADAPTER_RATE_PER_HOUR")
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
 }
 
 func main() {

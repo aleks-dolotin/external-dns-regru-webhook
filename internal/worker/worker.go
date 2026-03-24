@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/adapter"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/metrics"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/queue"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/ratelimit"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/retry"
 )
 
@@ -34,6 +36,8 @@ type WorkerPool struct {
 	adapter     adapter.Adapter
 	queue       *queue.InMemoryQueue
 	retryPolicy retry.Policy
+	limiter     *ratelimit.ZoneLimiter // Story 5.1: per-zone rate limiter (nil = disabled)
+	breaker     CircuitBreakers        // Story 5.4: per-zone circuit breaker (nil = disabled)
 	wg          sync.WaitGroup
 	stop        chan struct{}
 	workerCount int32 // atomic: running workers
@@ -42,6 +46,18 @@ type WorkerPool struct {
 	lastHeartbeat time.Time            // last successful operation time
 	lastErrors    map[string]ZoneError // last error per zone
 	failedOps     []FailedOp           // dead-letter list
+}
+
+// CircuitBreakers is an interface for per-zone circuit breaker checks.
+// Implemented by circuitbreaker.Manager (Story 5.4).
+type CircuitBreakers interface {
+	// AllowRequest returns nil if the circuit for the zone is closed/half-open,
+	// or an error if the circuit is open.
+	AllowRequest(zone string) error
+	// RecordSuccess records a successful operation for the zone.
+	RecordSuccess(zone string)
+	// RecordFailure records a failed operation for the zone.
+	RecordFailure(zone string)
 }
 
 // New creates a WorkerPool with the default retry policy.
@@ -58,6 +74,16 @@ func New(adapter adapter.Adapter, q *queue.InMemoryQueue) *WorkerPool {
 // SetRetryPolicy overrides the default retry policy.
 func (p *WorkerPool) SetRetryPolicy(pol retry.Policy) {
 	p.retryPolicy = pol
+}
+
+// SetLimiter attaches a per-zone rate limiter (Story 5.1).
+func (p *WorkerPool) SetLimiter(lim *ratelimit.ZoneLimiter) {
+	p.limiter = lim
+}
+
+// SetCircuitBreakers attaches per-zone circuit breakers (Story 5.4).
+func (p *WorkerPool) SetCircuitBreakers(cb CircuitBreakers) {
+	p.breaker = cb
 }
 
 // WorkerCount returns the number of currently running workers.
@@ -132,19 +158,69 @@ func (p *WorkerPool) handleWithRetry(ctx context.Context, op *queue.Operation) {
 		return
 	}
 
-	result := p.retryPolicy.Do(ctx, func() error {
-		return p.dispatch(adapterOp)
+	// Story 5.4: check circuit breaker before processing.
+	if p.breaker != nil {
+		if err := p.breaker.AllowRequest(adapterOp.Zone); err != nil {
+			log.Printf("worker: op %s rejected by circuit breaker for zone %s: %v", op.ID, adapterOp.Zone, err)
+			p.recordZoneError(adapterOp.Zone, err)
+			// Re-enqueue for later retry when circuit closes.
+			p.queue.Enqueue(*op)
+			return
+		}
+	}
+
+	// Story 5.1: enforce per-zone rate limit before dispatch.
+	if p.limiter != nil {
+		if err := p.limiter.Wait(ctx, adapterOp.Zone); err != nil {
+			log.Printf("worker: op %s rate-limited for zone %s: %v", op.ID, adapterOp.Zone, err)
+			metrics.RateLimitedTotal.WithLabelValues(adapterOp.Zone).Inc()
+			// Re-enqueue so the operation is not lost.
+			p.queue.Enqueue(*op)
+			return
+		}
+	}
+
+	// Story 5.2: use DoWithRetryAfter to honor Retry-After headers and record backoff metrics.
+	var lastRetryAfterWait time.Duration
+	result := p.retryPolicy.DoWithRetryAfter(ctx, func() error {
+		lastRetryAfterWait = 0 // reset per attempt
+		err := p.dispatch(adapterOp)
+		if err != nil {
+			// Extract Retry-After duration from 429/503 responses (Story 5.2).
+			var raErr *adapter.RetryAfterError
+			if errors.As(err, &raErr) && raErr.Wait > 0 {
+				lastRetryAfterWait = raErr.Wait
+			}
+		}
+		return err
+	}, func() time.Duration {
+		return lastRetryAfterWait
 	}, func(attempt int, err error) {
+		reason := "backoff"
+		if lastRetryAfterWait > 0 {
+			reason = "retry-after-header"
+		}
 		metrics.RetriesTotal.Inc()
-		log.Printf("worker: retrying op %s (attempt %d): %v", op.ID, attempt, err)
+		metrics.APIRetriesTotal.WithLabelValues(adapterOp.Zone, reason).Inc()
+		log.Printf("worker: retrying op %s (attempt %d, reason=%s): %v", op.ID, attempt, reason, err)
+	}, func(wait time.Duration) {
+		metrics.APIBackoffSeconds.WithLabelValues(adapterOp.Zone).Observe(wait.Seconds())
 	})
 
 	if result.Success {
+		// Story 5.4: record success for circuit breaker.
+		if p.breaker != nil {
+			p.breaker.RecordSuccess(adapterOp.Zone)
+		}
 		p.mu.Lock()
 		p.lastHeartbeat = time.Now().UTC()
 		p.mu.Unlock()
 		log.Printf("worker: op %s succeeded after %d attempt(s)", op.ID, result.Attempts)
 	} else {
+		// Story 5.4: record failure for circuit breaker.
+		if p.breaker != nil {
+			p.breaker.RecordFailure(adapterOp.Zone)
+		}
 		// Dead-letter: max retries exhausted
 		log.Printf("worker: op %s FAILED after %d attempts: %v", op.ID, result.Attempts, result.Err)
 		metrics.FailedOpsTotal.WithLabelValues(adapterOp.Action).Inc()
