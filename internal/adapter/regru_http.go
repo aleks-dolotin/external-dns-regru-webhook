@@ -543,7 +543,6 @@ func (h *HTTPAdapter) DeleteRecord(zone string, id string) error {
 
 // BulkUpdate performs multiple add/remove actions sequentially using
 // client-accessible endpoints (zone/add_*, zone/remove_record).
-// Note: the reseller-only zone/update_records endpoint is not used.
 func (h *HTTPAdapter) BulkUpdate(zone string, actions []BulkAction) error {
 	if len(actions) == 0 {
 		return nil
