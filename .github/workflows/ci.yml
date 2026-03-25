@@ -61,5 +61,5 @@ jobs:
 
       - name: Verify image runs
         run: |
-          docker run --rm reg-adapter:${{ github.sha }} --help || true
+          docker run --rm reg-adapter:${{ github.sha }} --version
           echo "Docker image built successfully"
