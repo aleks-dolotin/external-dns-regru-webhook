@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -205,6 +206,101 @@ func TestClassifyAPIError_SuccessResult(t *testing.T) {
 	err := classifyAPIError([]byte(`{"result":"success"}`))
 	if err != nil {
 		t.Errorf("expected nil for success result, got %v", err)
+	}
+}
+
+// --- ResourceRecord prio field: string vs number ---
+
+func TestResourceRecord_UnmarshalJSON_PrioAsString(t *testing.T) {
+	data := []byte(`{"subname":"www","rectype":"A","content":"1.2.3.4","prio":"10","state":"A"}`)
+	var rr ResourceRecord
+	if err := json.Unmarshal(data, &rr); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if rr.Priority != "10" {
+		t.Errorf("expected priority '10', got %q", rr.Priority)
+	}
+	if rr.Subname != "www" || rr.Content != "1.2.3.4" {
+		t.Errorf("unexpected fields: %+v", rr)
+	}
+}
+
+func TestResourceRecord_UnmarshalJSON_PrioAsNumber(t *testing.T) {
+	data := []byte(`{"subname":"mail","rectype":"MX","content":"mx.example.com","prio":5,"state":"A"}`)
+	var rr ResourceRecord
+	if err := json.Unmarshal(data, &rr); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if rr.Priority != "5" {
+		t.Errorf("expected priority '5', got %q", rr.Priority)
+	}
+}
+
+func TestResourceRecord_UnmarshalJSON_PrioZeroNumber(t *testing.T) {
+	data := []byte(`{"subname":"@","rectype":"A","content":"10.0.0.1","prio":0}`)
+	var rr ResourceRecord
+	if err := json.Unmarshal(data, &rr); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if rr.Priority != "0" {
+		t.Errorf("expected priority '0', got %q", rr.Priority)
+	}
+}
+
+func TestResourceRecord_UnmarshalJSON_PrioZeroString(t *testing.T) {
+	data := []byte(`{"subname":"@","rectype":"A","content":"10.0.0.1","prio":"0"}`)
+	var rr ResourceRecord
+	if err := json.Unmarshal(data, &rr); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if rr.Priority != "0" {
+		t.Errorf("expected priority '0', got %q", rr.Priority)
+	}
+}
+
+func TestResourceRecord_UnmarshalJSON_PrioMissing(t *testing.T) {
+	data := []byte(`{"subname":"@","rectype":"A","content":"10.0.0.1"}`)
+	var rr ResourceRecord
+	if err := json.Unmarshal(data, &rr); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if rr.Priority != "" {
+		t.Errorf("expected empty priority, got %q", rr.Priority)
+	}
+}
+
+func TestResourceRecord_UnmarshalJSON_FullResponse(t *testing.T) {
+	// Simulate real Reg.ru production response with numeric prio and service_id.
+	data := []byte(`{
+		"result": "success",
+		"answer": {
+			"domains": [{
+				"dname": "example.com",
+				"result": "success",
+				"service_id": 12345,
+				"rrs": [
+					{"subname":"@","rectype":"A","content":"1.2.3.4","prio":0,"state":"A"},
+					{"subname":"mail","rectype":"MX","content":"mx.example.com","prio":10,"state":"A"}
+				]
+			}]
+		}
+	}`)
+	var resp ReguResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatalf("unmarshal full response: %v", err)
+	}
+	if len(resp.Answer.Domains) != 1 {
+		t.Fatalf("expected 1 domain, got %d", len(resp.Answer.Domains))
+	}
+	rrs := resp.Answer.Domains[0].Rrs
+	if len(rrs) != 2 {
+		t.Fatalf("expected 2 rrs, got %d", len(rrs))
+	}
+	if rrs[0].Priority != "0" {
+		t.Errorf("rrs[0] expected prio '0', got %q", rrs[0].Priority)
+	}
+	if rrs[1].Priority != "10" {
+		t.Errorf("rrs[1] expected prio '10', got %q", rrs[1].Priority)
 	}
 }
 

@@ -38,12 +38,53 @@ type DomainResult struct {
 
 // ResourceRecord represents a single DNS resource record returned by
 // zone/get_resource_records.
+//
+// NOTE: The Reg.ru API returns "prio" as a string in test mode (username=test)
+// but as a number (int) in production. The custom UnmarshalJSON handles both.
+// See: https://github.com/daloman/regru-api-go
 type ResourceRecord struct {
 	Subname  string `json:"subname"`
 	Rectype  string `json:"rectype"`
 	Content  string `json:"content"`
-	Priority string `json:"prio"`
+	Priority string // unmarshalled from "prio" (string or number)
 	State    string `json:"state,omitempty"`
+}
+
+// UnmarshalJSON implements custom JSON unmarshalling for ResourceRecord.
+// Handles the "prio" field which can be either a string ("0") or a number (0)
+// depending on test vs production Reg.ru API.
+func (rr *ResourceRecord) UnmarshalJSON(data []byte) error {
+	// Use an alias to avoid infinite recursion.
+	type Alias struct {
+		Subname string          `json:"subname"`
+		Rectype string          `json:"rectype"`
+		Content string          `json:"content"`
+		Prio    json.RawMessage `json:"prio"`
+		State   string          `json:"state,omitempty"`
+	}
+	var raw Alias
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	rr.Subname = raw.Subname
+	rr.Rectype = raw.Rectype
+	rr.Content = raw.Content
+	rr.State = raw.State
+
+	// Parse prio: try string first, then number.
+	if len(raw.Prio) > 0 {
+		var s string
+		if err := json.Unmarshal(raw.Prio, &s); err == nil {
+			rr.Priority = s
+		} else {
+			var n int
+			if err := json.Unmarshal(raw.Prio, &n); err == nil {
+				rr.Priority = fmt.Sprintf("%d", n)
+			}
+			// If neither works, leave Priority empty.
+		}
+	}
+	return nil
 }
 
 // ActionResult represents the result of a single action in zone/update_records.

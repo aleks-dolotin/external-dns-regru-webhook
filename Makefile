@@ -3,7 +3,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 .PHONY: test test-cover test-race lint vet build \
        setup-hooks pre-commit \
-       mock-start mock-stop mock-status test-integration test-integration-python validate-openapi k8s-apply k8s-destroy
+       mock-start mock-stop mock-status test-integration test-integration-python test-smoke validate-openapi k8s-apply k8s-destroy
 
 ## ---------- Go build & quality ----------
 
@@ -73,6 +73,11 @@ test-integration: mock-start
 test-integration-python:
 	@echo "Running Python integration tests (mock-regru)..."
 	@python3 -m pytest -q tests/integration/mock-regru/test_mock_regu.py
+
+test-smoke:
+	@echo "Running smoke tests against real Reg.ru API..."
+	@echo "Required env: REGU_USERNAME, REGU_PASSWORD, SMOKE_TEST_ZONE"
+	go test -v -tags=smoke -count=1 -timeout=300s ./tests/smoke/...
 
 validate-openapi:
 	@node -v >/dev/null 2>&1 || echo "Node not found — install node to run openapi-cli"

@@ -395,6 +395,42 @@ func buildActionPayload(action, subdomain, content string, recType string) map[s
 	return entry
 }
 
+// recordTypeEndpoint maps DNS record types to Reg.ru API endpoint paths.
+// These endpoints are available to all clients (not reseller-only).
+func recordTypeEndpoint(recType string) (string, error) {
+	switch strings.ToUpper(recType) {
+	case "A":
+		return "zone/add_alias", nil
+	case "AAAA":
+		return "zone/add_aaaa", nil
+	case "CNAME":
+		return "zone/add_cname", nil
+	case "TXT":
+		return "zone/add_txt", nil
+	default:
+		return "", fmt.Errorf("%w: %s", ErrUnsupportedRecordType, recType)
+	}
+}
+
+// addRecordInputData builds the input_data for a zone/add_* client endpoint.
+func addRecordInputData(zone, subdomain, content, recType string) (map[string]interface{}, error) {
+	inputData := map[string]interface{}{
+		"domains":   []map[string]interface{}{{"dname": zone}},
+		"subdomain": subdomain,
+	}
+	switch strings.ToUpper(recType) {
+	case "A", "AAAA":
+		inputData["ipaddr"] = content
+	case "CNAME":
+		inputData["canonical_name"] = content
+	case "TXT":
+		inputData["text"] = content
+	default:
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedRecordType, recType)
+	}
+	return inputData, nil
+}
+
 func (h *HTTPAdapter) CreateRecord(zone string, r *Record) error {
 	// FR14 idempotency: check if record already exists.
 	existing, err := h.FindRecord(zone, r.Name, r.Type)
@@ -407,19 +443,15 @@ func (h *HTTPAdapter) CreateRecord(zone string, r *Record) error {
 		return nil
 	}
 
-	action, err := recordTypeAction(r.Type)
+	epPath, err := recordTypeEndpoint(r.Type)
 	if err != nil {
 		return err
 	}
 
-	endpoint := fmt.Sprintf("%s/zone/update_records", h.baseURL)
-	actionEntry := buildActionPayload(action, r.Name, r.Content, r.Type)
-
-	inputData := map[string]interface{}{
-		"domains": []map[string]interface{}{{
-			"dname":       zone,
-			"action_list": []map[string]interface{}{actionEntry},
-		}},
+	endpoint := fmt.Sprintf("%s/%s", h.baseURL, epPath)
+	inputData, err := addRecordInputData(zone, r.Name, r.Content, r.Type)
+	if err != nil {
+		return err
 	}
 
 	reguResp, err := h.doRequest(endpoint, inputData)
@@ -460,45 +492,14 @@ func (h *HTTPAdapter) UpdateRecord(zone string, r *Record) error {
 		return nil
 	}
 
-	// Atomic update: remove old + add new in single update_records call.
-	action, err := recordTypeAction(r.Type)
-	if err != nil {
-		return err
+	// Two-step update: remove old record, then add new one.
+	// Uses client-accessible endpoints (zone/remove_record + zone/add_*).
+	deleteID := fmt.Sprintf("%s:%s:%s", r.Name, r.Type, existing.Content)
+	if err := h.DeleteRecord(zone, deleteID); err != nil {
+		return fmt.Errorf("update remove old: %w", err)
 	}
 
-	removeEntry := map[string]interface{}{
-		"action":      "remove_record",
-		"subdomain":   r.Name,
-		"record_type": r.Type,
-		"content":     existing.Content,
-	}
-	addEntry := buildActionPayload(action, r.Name, r.Content, r.Type)
-
-	endpoint := fmt.Sprintf("%s/zone/update_records", h.baseURL)
-	inputData := map[string]interface{}{
-		"domains": []map[string]interface{}{{
-			"dname":       zone,
-			"action_list": []map[string]interface{}{removeEntry, addEntry},
-		}},
-	}
-
-	reguResp, err := h.doRequest(endpoint, inputData)
-	if err != nil {
-		return err
-	}
-
-	domain, err := checkDomainResult(reguResp)
-	if err != nil {
-		return err
-	}
-	if domain != nil && domain.ServiceID.String() != "" {
-		r.ID = domain.ServiceID.String()
-	}
-
-	// Update cache after successful update.
-	h.cacheSet(zone, r.Name, r.Type, r.ID)
-
-	return nil
+	return h.CreateRecord(zone, r)
 }
 
 func (h *HTTPAdapter) DeleteRecord(zone string, id string) error {
@@ -540,53 +541,26 @@ func (h *HTTPAdapter) DeleteRecord(zone string, id string) error {
 	return nil
 }
 
+// BulkUpdate performs multiple add/remove actions sequentially using
+// client-accessible endpoints (zone/add_*, zone/remove_record).
+// Note: the reseller-only zone/update_records endpoint is not used.
 func (h *HTTPAdapter) BulkUpdate(zone string, actions []BulkAction) error {
 	if len(actions) == 0 {
 		return nil
 	}
 
-	actionList := make([]map[string]interface{}, 0, len(actions))
 	for _, ba := range actions {
-		entry := map[string]interface{}{
-			"action":    ba.Action,
-			"subdomain": ba.Subdomain,
-		}
 		if ba.Action == "remove_record" {
-			entry["record_type"] = ba.RecType
-			if ba.Content != "" {
-				entry["content"] = ba.Content
+			deleteID := fmt.Sprintf("%s:%s:%s", ba.Subdomain, ba.RecType, ba.Content)
+			if err := h.DeleteRecord(zone, deleteID); err != nil {
+				return fmt.Errorf("bulk remove %s/%s: %w", ba.Subdomain, ba.RecType, err)
 			}
 		} else {
-			// Determine content field by record type.
-			switch strings.ToUpper(ba.RecType) {
-			case "A", "AAAA":
-				entry["ipaddr"] = ba.Content
-			case "CNAME":
-				entry["canonical_name"] = ba.Content
-			case "TXT":
-				entry["text"] = ba.Content
-			default:
-				entry["content"] = ba.Content
+			rec := &Record{Name: ba.Subdomain, Type: ba.RecType, Content: ba.Content}
+			if err := h.CreateRecord(zone, rec); err != nil {
+				return fmt.Errorf("bulk add %s/%s: %w", ba.Subdomain, ba.RecType, err)
 			}
 		}
-		actionList = append(actionList, entry)
-	}
-
-	endpoint := fmt.Sprintf("%s/zone/update_records", h.baseURL)
-	inputData := map[string]interface{}{
-		"domains": []map[string]interface{}{{
-			"dname":       zone,
-			"action_list": actionList,
-		}},
-	}
-
-	reguResp, err := h.doRequest(endpoint, inputData)
-	if err != nil {
-		return err
-	}
-
-	if _, err := checkDomainResult(reguResp); err != nil {
-		return err
 	}
 
 	return nil
