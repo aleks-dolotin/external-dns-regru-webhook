@@ -4,6 +4,10 @@
 Supports endpoints:
 - POST /api/regru2/zone/get_resource_records
 - POST /api/regru2/zone/update_records
+- POST /api/regru2/zone/add_alias      (A record)
+- POST /api/regru2/zone/add_aaaa       (AAAA record)
+- POST /api/regru2/zone/add_cname      (CNAME record)
+- POST /api/regru2/zone/add_txt        (TXT record)
 - POST /api/regru2/zone/remove_record
 - DELETE /reset  (admin: clears all in-memory records)
 - GET /healthz   (admin: health check)
@@ -24,6 +28,7 @@ Authentication:
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
+from typing import Dict, List, Optional, Tuple
 import json
 import os
 import sys
@@ -51,7 +56,7 @@ SIMULATE_5XX_EVERY_N = int(os.getenv("MOCK_SIMULATE_5XX_EVERY_N", "4"))
 # ---------------------------------------------------------------------------
 _lock = threading.Lock()
 # records: dict[ (zone, subdomain, rectype) ] -> { "content": str, "prio": str, "state": str }
-_records: dict[tuple[str, str, str], dict] = {}
+_records: Dict[Tuple[str, str, str], dict] = {}
 # Global request counter for error simulation.
 _request_counter = 0
 
@@ -73,7 +78,7 @@ def _reset_state():
 # ---------------------------------------------------------------------------
 # Helper: build Reg.ru-compatible response envelope
 # ---------------------------------------------------------------------------
-def _success_response(domains: list[dict]) -> dict:
+def _success_response(domains: List[dict]) -> dict:
     return {"result": "success", "answer": {"domains": domains}}
 
 
@@ -81,7 +86,7 @@ def _error_response(error_code: str, error_text: str) -> dict:
     return {"result": "error", "error_code": error_code, "error_text": error_text}
 
 
-def _domain_success(dname: str, rrs: list | None = None, action_list: list | None = None) -> dict:
+def _domain_success(dname: str, rrs: Optional[list] = None, action_list: Optional[list] = None) -> dict:
     d: dict = {"dname": dname, "result": "success", "service_id": 12345}
     if rrs is not None:
         d["rrs"] = rrs
@@ -93,7 +98,7 @@ def _domain_success(dname: str, rrs: list | None = None, action_list: list | Non
 # ---------------------------------------------------------------------------
 # Record helpers
 # ---------------------------------------------------------------------------
-def _get_records_for_zone(zone: str) -> list[dict]:
+def _get_records_for_zone(zone: str) -> List[dict]:
     """Return all resource records stored for a given zone."""
     with _lock:
         result = []
@@ -161,7 +166,7 @@ def _apply_action(zone: str, action_entry: dict) -> dict:
 class MockHandler(BaseHTTPRequestHandler):
     """Handler for mock Reg.ru API v2 endpoints."""
 
-    def _send_json(self, code: int, data: dict, extra_headers: dict | None = None):
+    def _send_json(self, code: int, data: dict, extra_headers: Optional[dict] = None):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         if extra_headers:
@@ -170,7 +175,7 @@ class MockHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode("utf-8"))
 
-    def _parse_input_data(self) -> dict | None:
+    def _parse_input_data(self) -> Optional[dict]:
         """Read POST body, parse form-encoded input_data JSON."""
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8")
@@ -182,7 +187,7 @@ class MockHandler(BaseHTTPRequestHandler):
                 return None
         return None
 
-    def _check_auth(self, input_data: dict | None) -> bool:
+    def _check_auth(self, input_data: Optional[dict]) -> bool:
         """Validate authentication if MOCK_USERNAME/MOCK_PASSWORD are configured."""
         if not MOCK_USERNAME and not MOCK_PASSWORD:
             return True  # auth not configured — allow all
@@ -255,10 +260,18 @@ class MockHandler(BaseHTTPRequestHandler):
             self._handle_update_records(input_data)
         elif path.endswith("/zone/remove_record"):
             self._handle_remove_record(input_data)
+        elif path.endswith("/zone/add_alias"):
+            self._handle_add_record(input_data, "A", "ipaddr")
+        elif path.endswith("/zone/add_aaaa"):
+            self._handle_add_record(input_data, "AAAA", "ipaddr")
+        elif path.endswith("/zone/add_cname"):
+            self._handle_add_record(input_data, "CNAME", "canonical_name")
+        elif path.endswith("/zone/add_txt"):
+            self._handle_add_record(input_data, "TXT", "text")
         else:
             self._send_json(404, _error_response("UNKNOWN_ENDPOINT", f"Unknown endpoint: {path}"))
 
-    def _handle_get_resource_records(self, input_data: dict | None):
+    def _handle_get_resource_records(self, input_data: Optional[dict]):
         domains_in = (input_data or {}).get("domains", [])
         domains_out = []
         for d in domains_in:
@@ -267,7 +280,7 @@ class MockHandler(BaseHTTPRequestHandler):
             domains_out.append(_domain_success(dname, rrs=rrs))
         self._send_json(200, _success_response(domains_out))
 
-    def _handle_update_records(self, input_data: dict | None):
+    def _handle_update_records(self, input_data: Optional[dict]):
         domains_in = (input_data or {}).get("domains", [])
         domains_out = []
         for d in domains_in:
@@ -280,7 +293,7 @@ class MockHandler(BaseHTTPRequestHandler):
             domains_out.append(_domain_success(dname, action_list=results))
         self._send_json(200, _success_response(domains_out))
 
-    def _handle_remove_record(self, input_data: dict | None):
+    def _handle_remove_record(self, input_data: Optional[dict]):
         if input_data is None:
             self._send_json(200, _error_response("INVALID_INPUT", "Missing input_data"))
             return
@@ -296,6 +309,29 @@ class MockHandler(BaseHTTPRequestHandler):
             with _lock:
                 if key in _records:
                     del _records[key]
+            domains_out.append(_domain_success(dname))
+        self._send_json(200, _success_response(domains_out))
+
+    def _handle_add_record(self, input_data: Optional[dict], rectype: str, content_field: str):
+        """Handle individual zone/add_alias, zone/add_aaaa, zone/add_cname, zone/add_txt endpoints."""
+        if input_data is None:
+            self._send_json(200, _error_response("INVALID_INPUT", "Missing input_data"))
+            return
+
+        domains_in = input_data.get("domains", [])
+        subdomain = input_data.get("subdomain", "")
+        content = input_data.get(content_field, "")
+
+        domains_out = []
+        for d in domains_in:
+            dname = d.get("dname", "")
+            key = (dname, subdomain, rectype)
+            with _lock:
+                _records[key] = {
+                    "content": content,
+                    "prio": "",
+                    "state": "A",
+                }
             domains_out.append(_domain_success(dname))
         self._send_json(200, _success_response(domains_out))
 
