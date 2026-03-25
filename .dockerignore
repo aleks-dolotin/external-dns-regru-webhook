@@ -1,0 +1,12 @@
+bin/
+_bmad/
+_bmad-output/
+.git/
+.github/prompts/
+*.md
+!README.md
+coverage.out
+devtools/
+tests/
+charts/
+k8s/

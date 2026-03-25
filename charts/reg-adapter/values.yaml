@@ -1,14 +1,14 @@
 replicaCount: 2
 
 image:
-  repository: ghcr.io/example/reg-adapter
+  repository: ghcr.io/aleks-dolotin/external-dns-regru-webhook
   tag: latest
   pullPolicy: IfNotPresent
 
 worker:
   replicaCount: 2
   image:
-    repository: ghcr.io/example/reg-adapter-worker
+    repository: ghcr.io/aleks-dolotin/external-dns-regru-webhook-worker
     tag: latest
     pullPolicy: IfNotPresent
 
