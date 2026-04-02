@@ -1,8 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: reg-adapter
-  labels:
-    app.kubernetes.io/name: reg-adapter
-    app.kubernetes.io/managed-by: bmad
-

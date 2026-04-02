@@ -361,6 +361,37 @@ func (h *HTTPAdapter) FindRecord(zone, name, typ string) (*Record, error) {
 // ErrUnsupportedRecordType is returned when the DNS record type is not supported.
 var ErrUnsupportedRecordType = errors.New("adapter: unsupported record type")
 
+// ListRecords returns all DNS records for the given zone.
+func (h *HTTPAdapter) ListRecords(zone string) ([]Record, error) {
+	endpoint := fmt.Sprintf("%s/zone/get_resource_records", h.baseURL)
+
+	inputData := map[string]interface{}{
+		"domains": []map[string]interface{}{{"dname": zone}},
+	}
+
+	reguResp, err := h.doRequest(endpoint, inputData)
+	if err != nil {
+		return nil, err
+	}
+
+	domain, err := checkDomainResult(reguResp)
+	if err != nil {
+		return nil, err
+	}
+	if domain == nil {
+		return nil, nil
+	}
+
+	var records []Record
+	for _, rr := range domain.Rrs {
+		records = append(records, Record{
+			Name:    rr.Subname,
+			Type:    rr.Rectype,
+			Content: rr.Content,
+		})
+	}
+	return records, nil
+}
 // recordTypeAction maps DNS record types to Reg.ru API action names.
 func recordTypeAction(recType string) (string, error) {
 	switch strings.ToUpper(recType) {
