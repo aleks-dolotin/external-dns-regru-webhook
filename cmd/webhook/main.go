@@ -68,10 +68,9 @@ func main() {
 
 	log.Printf("Starting external-dns webhook provider for Reg.ru (version=%s, port=%s, domains=%v)", Version, port, domains)
 
-	startedChan := make(chan struct{})
 	api.StartHTTPApi(
 		p,
-		startedChan,
+		nil, // no started signal needed
 		5_000_000_000,  // readTimeout: 5s
 		10_000_000_000, // writeTimeout: 10s
 		":"+port,
