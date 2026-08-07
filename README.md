@@ -51,6 +51,12 @@ provider:
             key: password
       - name: DOMAIN_FILTER
         value: "dolotin.ru"
+      - name: REGRU_HTTP_TIMEOUT
+        value: "10s"
+      - name: WEBHOOK_READ_TIMEOUT
+        value: "5s"
+      - name: WEBHOOK_WRITE_TIMEOUT
+        value: "60s"
 ```
 
 ## Environment variables
@@ -61,6 +67,11 @@ provider:
 | `REGU_PASSWORD` | Yes | Reg.ru API password |
 | `DOMAIN_FILTER` | Yes | Comma-separated list of zones |
 | `WEBHOOK_PORT` | No | HTTP port (default: 8888) |
+| `REGRU_HTTP_TIMEOUT` | No | Reg.ru API request timeout as a Go duration (default: `10s`) |
+| `WEBHOOK_READ_TIMEOUT` | No | Webhook HTTP server read timeout as a Go duration (default: `5s`) |
+| `WEBHOOK_WRITE_TIMEOUT` | No | Webhook HTTP server write timeout as a Go duration (default: `60s`) |
+
+Timeout values use [Go duration syntax](https://pkg.go.dev/time#ParseDuration), for example `500ms`, `10s`, or `1m30s`. They must be positive, and `WEBHOOK_WRITE_TIMEOUT` must be greater than `REGRU_HTTP_TIMEOUT`. Invalid settings stop the webhook during startup instead of falling back silently. Empty variables use the defaults above.
 
 ## API endpoints
 

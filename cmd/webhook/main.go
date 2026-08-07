@@ -1,18 +1,20 @@
 // external-dns webhook provider for Reg.ru DNS API v2.
 //
 // Implements the standard external-dns webhook protocol:
-//   GET  /           — negotiation, returns domain filter
-//   GET  /records    — list current DNS records
-//   POST /records    — apply changes (create/update/delete)
-//   POST /adjustendpoints — adjust endpoints (no-op)
+//
+//	GET  /           — negotiation, returns domain filter
+//	GET  /records    — list current DNS records
+//	POST /records    — apply changes (create/update/delete)
+//	POST /adjustendpoints — adjust endpoints (no-op)
 //
 // Runs as a sidecar container alongside external-dns.
 // Default port: 8888 (external-dns webhook default).
 //
 // Required environment variables:
-//   REGU_USERNAME   — Reg.ru API username
-//   REGU_PASSWORD   — Reg.ru API password
-//   DOMAIN_FILTER   — comma-separated list of zones (e.g. "dolotin.ru")
+//
+//	REGU_USERNAME   — Reg.ru API username
+//	REGU_PASSWORD   — Reg.ru API password
+//	DOMAIN_FILTER   — comma-separated list of zones (e.g. "dolotin.ru")
 package main
 
 import (
@@ -23,6 +25,7 @@ import (
 
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/adapter"
 	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/auth"
+	"github.com/aleks-dolotin/external-dns-regru-webhook/internal/config"
 	regprovider "github.com/aleks-dolotin/external-dns-regru-webhook/internal/provider"
 
 	"sigs.k8s.io/external-dns/endpoint"
@@ -37,6 +40,11 @@ func main() {
 		return
 	}
 
+	timeouts, err := config.LoadTimeouts()
+	if err != nil {
+		log.Fatalf("timeout config: %v", err)
+	}
+
 	// Load credentials
 	driver, err := auth.NewDriverFromEnv()
 	if err != nil {
@@ -44,7 +52,10 @@ func main() {
 	}
 
 	// Create Reg.ru adapter
-	httpAdapter := adapter.NewHTTPAdapter(driver)
+	httpAdapter, err := adapter.NewHTTPAdapterWithTimeout(driver, timeouts.RegruHTTP)
+	if err != nil {
+		log.Fatalf("adapter: %v", err)
+	}
 
 	// Parse domain filter
 	domainFilterStr := os.Getenv("DOMAIN_FILTER")
@@ -66,13 +77,21 @@ func main() {
 		port = "8888"
 	}
 
-	log.Printf("Starting external-dns webhook provider for Reg.ru (version=%s, port=%s, domains=%v)", Version, port, domains)
+	log.Printf(
+		"Starting external-dns webhook provider for Reg.ru (version=%s, port=%s, domains=%v, regru_http_timeout=%s, webhook_read_timeout=%s, webhook_write_timeout=%s)",
+		Version,
+		port,
+		domains,
+		timeouts.RegruHTTP,
+		timeouts.WebhookRead,
+		timeouts.WebhookWrite,
+	)
 
 	api.StartHTTPApi(
 		p,
 		nil, // no started signal needed
-		5_000_000_000,  // readTimeout: 5s
-		10_000_000_000, // writeTimeout: 10s
+		timeouts.WebhookRead,
+		timeouts.WebhookWrite,
 		":"+port,
 	)
 }

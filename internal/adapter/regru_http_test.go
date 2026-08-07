@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // --- helpers ---
@@ -76,6 +77,34 @@ func newTestAdapter(t *testing.T, handler http.HandlerFunc) *HTTPAdapter {
 	t.Cleanup(srv.Close)
 	t.Setenv("REGRU_BASE_URL", srv.URL)
 	return NewHTTPAdapter(nil)
+}
+
+func TestNewHTTPAdapter_DefaultTimeout(t *testing.T) {
+	got := NewHTTPAdapter(nil)
+	if got.client.Timeout != DefaultHTTPTimeout {
+		t.Errorf("client timeout = %s, want %s", got.client.Timeout, DefaultHTTPTimeout)
+	}
+}
+
+func TestNewHTTPAdapterWithTimeout(t *testing.T) {
+	const timeout = 37 * time.Second
+	got, err := NewHTTPAdapterWithTimeout(nil, timeout)
+	if err != nil {
+		t.Fatalf("NewHTTPAdapterWithTimeout() unexpected error: %v", err)
+	}
+	if got.client.Timeout != timeout {
+		t.Errorf("client timeout = %s, want %s", got.client.Timeout, timeout)
+	}
+}
+
+func TestNewHTTPAdapterWithTimeoutRejectsNonPositive(t *testing.T) {
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			if _, err := NewHTTPAdapterWithTimeout(nil, timeout); err == nil {
+				t.Fatalf("NewHTTPAdapterWithTimeout(%s) error = nil, want error", timeout)
+			}
+		})
+	}
 }
 
 // --- FindRecord tests ---

@@ -48,16 +48,31 @@ type HTTPAdapter struct {
 // DefaultBaseURL is the production Reg.ru API v2 endpoint.
 const DefaultBaseURL = "https://api.reg.ru/api/regru2"
 
+// DefaultHTTPTimeout is the maximum duration of a Reg.ru API request.
+const DefaultHTTPTimeout = 10 * time.Second
+
 // NewHTTPAdapter creates an HTTPAdapter with the given AuthDriver for request authentication.
 // If driver is nil, requests are sent without authentication credentials.
 // Base URL is read from REGRU_BASE_URL env var; defaults to the production Reg.ru API.
 func NewHTTPAdapter(driver auth.AuthDriver) *HTTPAdapter {
+	return newHTTPAdapter(driver, DefaultHTTPTimeout)
+}
+
+// NewHTTPAdapterWithTimeout creates an HTTPAdapter with an explicit Reg.ru API timeout.
+func NewHTTPAdapterWithTimeout(driver auth.AuthDriver, timeout time.Duration) (*HTTPAdapter, error) {
+	if timeout <= 0 {
+		return nil, fmt.Errorf("Reg.ru HTTP timeout must be positive, got %s", timeout)
+	}
+	return newHTTPAdapter(driver, timeout), nil
+}
+
+func newHTTPAdapter(driver auth.AuthDriver, timeout time.Duration) *HTTPAdapter {
 	base := os.Getenv("REGRU_BASE_URL")
 	if base == "" {
 		base = DefaultBaseURL
 	}
 	return &HTTPAdapter{
-		client:     &http.Client{Timeout: 10 * time.Second},
+		client:     &http.Client{Timeout: timeout},
 		baseURL:    base,
 		authDriver: driver,
 	}
@@ -392,6 +407,7 @@ func (h *HTTPAdapter) ListRecords(zone string) ([]Record, error) {
 	}
 	return records, nil
 }
+
 // recordTypeAction maps DNS record types to Reg.ru API action names.
 func recordTypeAction(recType string) (string, error) {
 	switch strings.ToUpper(recType) {
